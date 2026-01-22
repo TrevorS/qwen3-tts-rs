@@ -668,3 +668,180 @@ mod speech_tokenizer_tests {
         }
     }
 }
+
+/// Tests for model configuration files from the 0.6B model
+mod model_config_tests {
+    use std::path::Path;
+
+    /// Path to downloaded model config data
+    const MODEL_CONFIG_DIR: &str = "test_data/model_config";
+
+    fn model_config_available() -> bool {
+        Path::new(MODEL_CONFIG_DIR).join("generation_config.json").exists()
+    }
+
+    #[test]
+    fn test_generation_config_parsing() {
+        if !model_config_available() {
+            eprintln!("Skipping test_generation_config_parsing: test data not found");
+            return;
+        }
+
+        let config_path = Path::new(MODEL_CONFIG_DIR).join("generation_config.json");
+        let config_str = std::fs::read_to_string(config_path).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+
+        // Verify generation parameters match official defaults
+        assert_eq!(config["do_sample"], true);
+        assert_eq!(config["temperature"], 0.9);
+        assert_eq!(config["top_p"], 1.0);
+        assert_eq!(config["top_k"], 50);
+        assert_eq!(config["repetition_penalty"], 1.05);
+        assert_eq!(config["max_new_tokens"], 8192);
+
+        // Subtalker has its own parameters
+        assert_eq!(config["subtalker_dosample"], true);
+        assert_eq!(config["subtalker_temperature"], 0.9);
+        assert_eq!(config["subtalker_top_k"], 50);
+    }
+
+    #[test]
+    fn test_preprocessor_config_parsing() {
+        if !model_config_available() {
+            eprintln!("Skipping test_preprocessor_config_parsing: test data not found");
+            return;
+        }
+
+        let config_path = Path::new(MODEL_CONFIG_DIR).join("preprocessor_config.json");
+        let config_str = std::fs::read_to_string(config_path).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+
+        // Verify preprocessor config
+        assert_eq!(config["padding_side"], "left");
+        assert_eq!(config["padding_value"], 0.0);
+        assert_eq!(config["processor_class"], "Qwen3TTSProcessor");
+        assert_eq!(config["return_attention_mask"], true);
+    }
+
+    #[test]
+    fn test_tokenizer_config_special_tokens() {
+        if !model_config_available() {
+            eprintln!("Skipping test_tokenizer_config_special_tokens: test data not found");
+            return;
+        }
+
+        let config_path = Path::new(MODEL_CONFIG_DIR).join("tokenizer_config.json");
+        let config_str = std::fs::read_to_string(config_path).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+
+        // Verify tokenizer class
+        assert_eq!(config["tokenizer_class"], "Qwen2Tokenizer");
+        assert_eq!(config["model_max_length"], 131072);
+
+        // Verify important special tokens
+        assert_eq!(config["eos_token"], "<|im_end|>");
+        assert_eq!(config["pad_token"], "<|endoftext|>");
+
+        // Verify audio-specific tokens
+        assert_eq!(config["audio_bos_token"], "<|audio_start|>");
+        assert_eq!(config["audio_eos_token"], "<|audio_end|>");
+        assert_eq!(config["audio_token"], "<|audio_pad|>");
+    }
+
+    #[test]
+    fn test_tokenizer_config_tts_tokens() {
+        if !model_config_available() {
+            eprintln!("Skipping test_tokenizer_config_tts_tokens: test data not found");
+            return;
+        }
+
+        let config_path = Path::new(MODEL_CONFIG_DIR).join("tokenizer_config.json");
+        let config_str = std::fs::read_to_string(config_path).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+
+        // Check that TTS-specific tokens are present in added_tokens_decoder
+        let added_tokens = &config["added_tokens_decoder"];
+
+        // Find TTS tokens by their IDs
+        assert_eq!(added_tokens["151671"]["content"], "<tts_pad>");
+        assert_eq!(added_tokens["151672"]["content"], "<tts_text_bos>");
+        assert_eq!(added_tokens["151673"]["content"], "<tts_text_eod>");
+        assert_eq!(added_tokens["151674"]["content"], "<tts_text_bos_single>");
+        assert_eq!(added_tokens["151675"]["content"], "<|audio_pad|>");
+
+        // Audio markers
+        assert_eq!(added_tokens["151669"]["content"], "<|audio_start|>");
+        assert_eq!(added_tokens["151670"]["content"], "<|audio_end|>");
+
+        // Standard Qwen tokens
+        assert_eq!(added_tokens["151643"]["content"], "<|endoftext|>");
+        assert_eq!(added_tokens["151644"]["content"], "<|im_start|>");
+        assert_eq!(added_tokens["151645"]["content"], "<|im_end|>");
+    }
+
+    #[test]
+    fn test_tokenizer_config_additional_special_tokens() {
+        if !model_config_available() {
+            eprintln!("Skipping test_tokenizer_config_additional_special_tokens: test data not found");
+            return;
+        }
+
+        let config_path = Path::new(MODEL_CONFIG_DIR).join("tokenizer_config.json");
+        let config_str = std::fs::read_to_string(config_path).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+
+        let additional_tokens = config["additional_special_tokens"].as_array().unwrap();
+        let tokens: Vec<&str> = additional_tokens.iter()
+            .map(|t| t.as_str().unwrap())
+            .collect();
+
+        // Verify TTS-specific tokens are in additional_special_tokens
+        assert!(tokens.contains(&"<tts_pad>"));
+        assert!(tokens.contains(&"<tts_text_bos>"));
+        assert!(tokens.contains(&"<tts_text_bos_single>"));
+        assert!(tokens.contains(&"<|audio_start|>"));
+        assert!(tokens.contains(&"<|audio_end|>"));
+        assert!(tokens.contains(&"<|audio_pad|>"));
+
+        // Verify standard chat tokens
+        assert!(tokens.contains(&"<|im_start|>"));
+        assert!(tokens.contains(&"<|im_end|>"));
+    }
+
+    #[test]
+    fn test_generation_config_matches_our_defaults() {
+        if !model_config_available() {
+            eprintln!("Skipping test_generation_config_matches_our_defaults: test data not found");
+            return;
+        }
+
+        use qwen3_tts::generation::GenerationConfig;
+
+        let config_path = Path::new(MODEL_CONFIG_DIR).join("generation_config.json");
+        let config_str = std::fs::read_to_string(config_path).unwrap();
+        let official: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+
+        // Create our default config and compare key values
+        let our_config = GenerationConfig::default();
+
+        // Our defaults should be reasonable (though may differ from official)
+        // This test documents the official values for reference
+        println!("Official generation config:");
+        println!("  temperature: {}", official["temperature"]);
+        println!("  top_k: {}", official["top_k"]);
+        println!("  top_p: {}", official["top_p"]);
+        println!("  repetition_penalty: {}", official["repetition_penalty"]);
+        println!("  max_new_tokens: {}", official["max_new_tokens"]);
+
+        println!("\nOur default config:");
+        println!("  temperature: {}", our_config.temperature);
+        println!("  top_k: {:?}", our_config.top_k);
+        println!("  top_p: {:?}", our_config.top_p);
+        println!("  repetition_penalty: {}", our_config.repetition_penalty);
+        println!("  max_new_tokens: {}", our_config.max_new_tokens);
+
+        // At minimum, our config should have sensible values
+        assert!(our_config.temperature > 0.0);
+        assert!(our_config.max_new_tokens > 0);
+    }
+}

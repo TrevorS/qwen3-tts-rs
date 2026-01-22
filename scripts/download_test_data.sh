@@ -10,6 +10,7 @@ TEST_DATA_DIR="${SCRIPT_DIR}/../test_data"
 # Create directories
 mkdir -p "${TEST_DATA_DIR}/tokenizer"
 mkdir -p "${TEST_DATA_DIR}/speech_tokenizer"
+mkdir -p "${TEST_DATA_DIR}/model_config"
 
 echo "=== Downloading Text Tokenizer (7 MB) ==="
 if [ -f "${TEST_DATA_DIR}/tokenizer/tokenizer.json" ]; then
@@ -55,11 +56,40 @@ else
 fi
 
 echo ""
+echo "=== Downloading Model Config Files (8 KB) ==="
+if [ -f "${TEST_DATA_DIR}/model_config/generation_config.json" ]; then
+    echo "  generation_config.json already exists, skipping..."
+else
+    echo "  Downloading generation_config.json..."
+    curl -sL "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base/resolve/main/generation_config.json" \
+        -o "${TEST_DATA_DIR}/model_config/generation_config.json"
+fi
+
+if [ -f "${TEST_DATA_DIR}/model_config/preprocessor_config.json" ]; then
+    echo "  preprocessor_config.json already exists, skipping..."
+else
+    echo "  Downloading preprocessor_config.json..."
+    curl -sL "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base/resolve/main/preprocessor_config.json" \
+        -o "${TEST_DATA_DIR}/model_config/preprocessor_config.json"
+fi
+
+if [ -f "${TEST_DATA_DIR}/model_config/tokenizer_config.json" ]; then
+    echo "  tokenizer_config.json already exists, skipping..."
+else
+    echo "  Downloading tokenizer_config.json..."
+    curl -sL "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base/resolve/main/tokenizer_config.json" \
+        -o "${TEST_DATA_DIR}/model_config/tokenizer_config.json"
+fi
+
+echo ""
 echo "=== Download Summary ==="
 echo "Text tokenizer:"
 ls -lh "${TEST_DATA_DIR}/tokenizer/"
 echo ""
 echo "Speech tokenizer:"
 ls -lh "${TEST_DATA_DIR}/speech_tokenizer/"
+echo ""
+echo "Model config:"
+ls -lh "${TEST_DATA_DIR}/model_config/"
 echo ""
 echo "Done! Run 'cargo test' to execute tests with real weights."
