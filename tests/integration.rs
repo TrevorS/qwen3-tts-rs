@@ -299,3 +299,160 @@ mod end_to_end_mock {
         assert!(config.max_position_embeddings >= 4096);
     }
 }
+
+/// Tests using real downloaded weights (if available)
+/// These tests are skipped if test data is not present
+mod real_weights_tests {
+    use std::path::Path;
+
+    /// Path to downloaded test data
+    const TEST_DATA_DIR: &str = "test_data/tokenizer";
+
+    fn test_data_available() -> bool {
+        Path::new(TEST_DATA_DIR).join("tokenizer.json").exists()
+    }
+
+    #[test]
+    fn test_real_tokenizer_loading() {
+        if !test_data_available() {
+            eprintln!("Skipping test_real_tokenizer_loading: test data not found");
+            return;
+        }
+
+        use qwen3_tts::tokenizer::TextTokenizer;
+
+        let tokenizer_path = Path::new(TEST_DATA_DIR).join("tokenizer.json");
+        let tokenizer = TextTokenizer::from_file(&tokenizer_path).unwrap();
+
+        // Qwen2 tokenizer should have large vocab
+        assert!(tokenizer.vocab_size() > 150000);
+
+        // Check special tokens exist
+        assert!(tokenizer.token_to_id("<|im_start|>").is_some());
+        assert!(tokenizer.token_to_id("<|im_end|>").is_some());
+        assert!(tokenizer.token_to_id("<|endoftext|>").is_some());
+    }
+
+    #[test]
+    fn test_real_tokenizer_encoding() {
+        if !test_data_available() {
+            eprintln!("Skipping test_real_tokenizer_encoding: test data not found");
+            return;
+        }
+
+        use qwen3_tts::tokenizer::TextTokenizer;
+
+        let tokenizer_path = Path::new(TEST_DATA_DIR).join("tokenizer.json");
+        let tokenizer = TextTokenizer::from_file(&tokenizer_path).unwrap();
+
+        // Test encoding simple text
+        let text = "Hello, world!";
+        let ids = tokenizer.encode(text).unwrap();
+
+        // Should produce some tokens
+        assert!(!ids.is_empty());
+        assert!(ids.len() < 20); // Simple text should be compact
+
+        // Test decoding back
+        let decoded = tokenizer.decode(&ids).unwrap();
+        assert!(decoded.contains("Hello"));
+        assert!(decoded.contains("world"));
+    }
+
+    #[test]
+    fn test_real_tokenizer_chinese() {
+        if !test_data_available() {
+            eprintln!("Skipping test_real_tokenizer_chinese: test data not found");
+            return;
+        }
+
+        use qwen3_tts::tokenizer::TextTokenizer;
+
+        let tokenizer_path = Path::new(TEST_DATA_DIR).join("tokenizer.json");
+        let tokenizer = TextTokenizer::from_file(&tokenizer_path).unwrap();
+
+        // Qwen tokenizer supports Chinese
+        let text = "你好世界";
+        let ids = tokenizer.encode(text).unwrap();
+
+        assert!(!ids.is_empty());
+
+        let decoded = tokenizer.decode(&ids).unwrap();
+        assert!(decoded.contains("你好") || decoded.contains("世界"));
+    }
+
+    #[test]
+    fn test_real_tokenizer_chat_format() {
+        if !test_data_available() {
+            eprintln!("Skipping test_real_tokenizer_chat_format: test data not found");
+            return;
+        }
+
+        use qwen3_tts::tokenizer::TextTokenizer;
+
+        let tokenizer_path = Path::new(TEST_DATA_DIR).join("tokenizer.json");
+        let tokenizer = TextTokenizer::from_file(&tokenizer_path).unwrap();
+
+        // Test chat-style encoding
+        let ids = tokenizer.encode_chat("Hello", "user").unwrap();
+
+        // Should include special tokens in the encoding
+        assert!(!ids.is_empty());
+
+        // Decode and check format
+        let decoded = tokenizer.decode(&ids).unwrap();
+        assert!(decoded.contains("user") || decoded.contains("Hello"));
+    }
+
+    #[test]
+    fn test_real_tokenizer_batch() {
+        if !test_data_available() {
+            eprintln!("Skipping test_real_tokenizer_batch: test data not found");
+            return;
+        }
+
+        use qwen3_tts::tokenizer::TextTokenizer;
+
+        let tokenizer_path = Path::new(TEST_DATA_DIR).join("tokenizer.json");
+        let tokenizer = TextTokenizer::from_file(&tokenizer_path).unwrap();
+
+        let texts = ["Hello", "World", "Test"];
+        let batch = tokenizer.encode_batch(&texts).unwrap();
+
+        assert_eq!(batch.len(), 3);
+        for encoded in &batch {
+            assert!(!encoded.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_config_json_parsing() {
+        if !test_data_available() {
+            eprintln!("Skipping test_config_json_parsing: test data not found");
+            return;
+        }
+
+        // Read the real config.json and parse relevant fields
+        let config_path = Path::new(TEST_DATA_DIR).join("config.json");
+        let config_str = std::fs::read_to_string(config_path).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+
+        // Verify expected fields exist
+        assert_eq!(config["model_type"], "qwen3_tts");
+        assert!(config["talker_config"].is_object());
+        assert!(config["speaker_encoder_config"].is_object());
+
+        // Check talker config values
+        let talker = &config["talker_config"];
+        assert_eq!(talker["hidden_size"], 1024);
+        assert_eq!(talker["num_hidden_layers"], 28);
+        assert_eq!(talker["num_attention_heads"], 16);
+        assert_eq!(talker["num_key_value_heads"], 8);
+        assert_eq!(talker["num_code_groups"], 16);
+
+        // Check speaker encoder config
+        let speaker = &config["speaker_encoder_config"];
+        assert_eq!(speaker["enc_dim"], 1024);
+        assert_eq!(speaker["sample_rate"], 24000);
+    }
+}
