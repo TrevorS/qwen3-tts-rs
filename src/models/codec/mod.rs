@@ -22,12 +22,13 @@ use super::config::AudioCodecConfig;
 pub struct AudioCodec {
     config: AudioCodecConfig,
     decoder: CodecDecoder,
+    #[allow(dead_code)]
     device: Device,
 }
 
 impl AudioCodec {
     /// Load codec from pretrained weights
-    pub fn from_pretrained(model_id: &str, device: &Device) -> Result<Self> {
+    pub fn from_pretrained(model_id: &str, _device: &Device) -> Result<Self> {
         // TODO: Implement weight loading
         anyhow::bail!("Audio codec loading not yet implemented: {}", model_id)
     }

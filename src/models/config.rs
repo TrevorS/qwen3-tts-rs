@@ -35,6 +35,10 @@ pub struct Qwen3TTSConfig {
     #[serde(default)]
     pub num_key_value_heads: Option<usize>,
 
+    /// Head dimension (if not specified, computed as hidden_size / num_attention_heads)
+    #[serde(default)]
+    pub head_dim_override: Option<usize>,
+
     /// Maximum sequence length
     #[serde(default = "default_max_position_embeddings")]
     pub max_position_embeddings: usize,
@@ -150,6 +154,7 @@ impl Default for Qwen3TTSConfig {
             num_hidden_layers: default_num_hidden_layers(),
             num_attention_heads: default_num_attention_heads(),
             num_key_value_heads: None,
+            head_dim_override: None,
             max_position_embeddings: default_max_position_embeddings(),
             rope_theta: default_rope_theta(),
             rms_norm_eps: default_rms_norm_eps(),
@@ -199,9 +204,10 @@ impl Qwen3TTSConfig {
         self.num_key_value_heads.unwrap_or(self.num_attention_heads)
     }
 
-    /// Head dimension
+    /// Head dimension (uses override if set, otherwise computes from hidden_size)
     pub fn head_dim(&self) -> usize {
-        self.hidden_size / self.num_attention_heads
+        self.head_dim_override
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 }
 
@@ -308,8 +314,10 @@ mod tests {
 
     #[test]
     fn test_num_kv_heads_explicit() {
-        let mut config = Qwen3TTSConfig::default();
-        config.num_key_value_heads = Some(7);
+        let config = Qwen3TTSConfig {
+            num_key_value_heads: Some(7),
+            ..Default::default()
+        };
         assert_eq!(config.num_kv_heads(), 7);
     }
 
@@ -322,9 +330,11 @@ mod tests {
 
     #[test]
     fn test_head_dim_custom() {
-        let mut config = Qwen3TTSConfig::default();
-        config.hidden_size = 1024;
-        config.num_attention_heads = 16;
+        let config = Qwen3TTSConfig {
+            hidden_size: 1024,
+            num_attention_heads: 16,
+            ..Default::default()
+        };
         assert_eq!(config.head_dim(), 64);
     }
 

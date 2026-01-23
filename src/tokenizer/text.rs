@@ -43,7 +43,7 @@ fn create_mock_tokenizer() -> Tokenizer {
         .unwrap();
 
     let mut tokenizer = Tokenizer::new(bpe);
-    tokenizer.with_pre_tokenizer(Some(Whitespace::default()));
+    tokenizer.with_pre_tokenizer(Some(Whitespace));
     tokenizer
 }
 
@@ -79,17 +79,11 @@ impl TextTokenizer {
     /// This is useful for creating tokenizers from custom configurations in tests.
     pub fn from_tokenizer(tokenizer: Tokenizer) -> Result<Self> {
         // Get special token IDs (Qwen2 defaults)
-        let bos_token_id = tokenizer
-            .token_to_id("<|im_start|>")
-            .unwrap_or(151643);
+        let bos_token_id = tokenizer.token_to_id("<|im_start|>").unwrap_or(151643);
 
-        let eos_token_id = tokenizer
-            .token_to_id("<|im_end|>")
-            .unwrap_or(151645);
+        let eos_token_id = tokenizer.token_to_id("<|im_end|>").unwrap_or(151645);
 
-        let pad_token_id = tokenizer
-            .token_to_id("<|endoftext|>")
-            .unwrap_or(151643);
+        let pad_token_id = tokenizer.token_to_id("<|endoftext|>").unwrap_or(151643);
 
         Ok(Self {
             tokenizer,
@@ -101,7 +95,8 @@ impl TextTokenizer {
 
     /// Encode text to token IDs
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        let encoding = self.tokenizer
+        let encoding = self
+            .tokenizer
             .encode(text, false)
             .map_err(|e| anyhow!("Failed to encode text: {}", e))?;
 
@@ -136,7 +131,8 @@ impl TextTokenizer {
 
     /// Decode token IDs back to text
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
-        let text = self.tokenizer
+        let text = self
+            .tokenizer
             .decode(ids, true)
             .map_err(|e| anyhow!("Failed to decode tokens: {}", e))?;
 
@@ -160,7 +156,8 @@ impl TextTokenizer {
 
     /// Batch encode multiple texts
     pub fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<u32>>> {
-        let encodings = self.tokenizer
+        let encodings = self
+            .tokenizer
             .encode_batch(texts.to_vec(), false)
             .map_err(|e| anyhow!("Failed to batch encode: {}", e))?;
 
@@ -199,9 +196,11 @@ mod tests {
 
     #[test]
     fn test_default_special_tokens() {
-        // Test that default token IDs are reasonable
-        assert!(151643 > 0);  // BOS
-        assert!(151645 > 0);  // EOS
+        // Test that default token IDs have expected values (Qwen2 tokenizer)
+        let bos_id: u32 = 151643;
+        let eos_id: u32 = 151645;
+        assert_eq!(bos_id, 151643); // <|im_start|>
+        assert_eq!(eos_id, 151645); // <|im_end|>
     }
 
     #[test]

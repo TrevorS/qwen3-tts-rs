@@ -17,7 +17,10 @@ pub struct AudioBuffer {
 impl AudioBuffer {
     /// Create a new audio buffer
     pub fn new(samples: Vec<f32>, sample_rate: u32) -> Self {
-        Self { samples, sample_rate }
+        Self {
+            samples,
+            sample_rate,
+        }
     }
 
     /// Create from a Candle tensor (assumed shape: [samples] or [1, samples])
@@ -64,11 +67,7 @@ impl AudioBuffer {
 
     /// Normalize audio to [-1.0, 1.0] range
     pub fn normalize(&mut self) {
-        let max_abs = self
-            .samples
-            .iter()
-            .map(|s| s.abs())
-            .fold(0.0f32, f32::max);
+        let max_abs = self.samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
 
         if max_abs > 0.0 && max_abs != 1.0 {
             for sample in &mut self.samples {
@@ -80,11 +79,7 @@ impl AudioBuffer {
     /// Apply peak normalization to a target dB level
     pub fn normalize_db(&mut self, target_db: f32) {
         let target_amplitude = 10.0f32.powf(target_db / 20.0);
-        let max_abs = self
-            .samples
-            .iter()
-            .map(|s| s.abs())
-            .fold(0.0f32, f32::max);
+        let max_abs = self.samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
 
         if max_abs > 0.0 {
             let scale = target_amplitude / max_abs;
@@ -157,7 +152,6 @@ pub fn save_wav<P: AsRef<Path>>(path: P, samples: &[f32], sample_rate: u32) -> R
 mod tests {
     use super::*;
     use candle_core::Device;
-    use std::fs;
     use tempfile::tempdir;
 
     #[test]
@@ -217,7 +211,11 @@ mod tests {
     fn test_normalize_db() {
         let mut buffer = AudioBuffer::new(vec![0.5, -0.5, 0.25], 24000);
         buffer.normalize_db(-6.0); // -6 dB ≈ 0.5 amplitude
-        let max_abs = buffer.samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        let max_abs = buffer
+            .samples
+            .iter()
+            .map(|s| s.abs())
+            .fold(0.0f32, f32::max);
         assert!((max_abs - 0.501187).abs() < 0.01); // 10^(-6/20) ≈ 0.501
     }
 

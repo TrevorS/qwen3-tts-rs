@@ -4,8 +4,8 @@
 
 use anyhow::{Context, Result};
 use rubato::{
-    FastFixedIn, FastFixedOut, PolynomialDegree, Resampler as RubatoResampler,
-    SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+    FastFixedIn, PolynomialDegree, Resampler as RubatoResampler, SincFixedIn,
+    SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 
 use super::AudioBuffer;
@@ -97,11 +97,7 @@ impl Resampler {
         };
 
         let mut resampler = SincFixedIn::<f32>::new(
-            ratio,
-            1.0,
-            params,
-            chunk_size,
-            1, // mono
+            ratio, 1.0, params, chunk_size, 1, // mono
         )
         .context("Failed to create sinc resampler")?;
 
@@ -238,14 +234,20 @@ mod tests {
         // Create a low frequency sine wave that should survive resampling
         let freq = 100.0; // 100 Hz - well below Nyquist for both sample rates
         let audio = AudioBuffer::new(
-            (0..4800).map(|i| (2.0 * PI * freq * i as f32 / 48000.0).sin()).collect(),
+            (0..4800)
+                .map(|i| (2.0 * PI * freq * i as f32 / 48000.0).sin())
+                .collect(),
             48000,
         );
 
         let result = resample(&audio, 24000).unwrap();
 
         // Check that output has non-zero values
-        let max_val = result.samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        let max_val = result
+            .samples
+            .iter()
+            .map(|s| s.abs())
+            .fold(0.0f32, f32::max);
         assert!(max_val > 0.5); // Sine wave should maintain amplitude
     }
 

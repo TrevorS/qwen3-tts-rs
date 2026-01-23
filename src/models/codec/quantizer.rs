@@ -4,7 +4,7 @@
 //! to discretize continuous audio representations.
 
 use anyhow::Result;
-use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
+use candle_core::{IndexOp, Module, Tensor, D};
 use candle_nn::{embedding, Embedding, VarBuilder};
 
 /// Single vector quantizer with learnable codebook
@@ -132,7 +132,7 @@ impl ResidualVectorQuantizer {
     /// # Returns
     /// Tuple of (quantized sum, all indices [batch, num_q, seq])
     pub fn encode(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
-        let (batch, seq, _) = x.dims3()?;
+        let (_batch, _seq, _) = x.dims3()?;
         let mut residual = x.clone();
         let mut quantized_sum = Tensor::zeros(x.shape(), x.dtype(), x.device())?;
         let mut all_indices = Vec::with_capacity(self.num_quantizers);
@@ -164,7 +164,7 @@ impl ResidualVectorQuantizer {
     /// # Returns
     /// Embeddings of shape [batch, seq, num_quantizers, dim]
     pub fn decode(&self, indices: &Tensor) -> Result<Tensor> {
-        let (batch, num_q, seq) = indices.dims3()?;
+        let (_batch, num_q, _seq) = indices.dims3()?;
 
         let mut embeddings = Vec::with_capacity(num_q);
 
@@ -208,6 +208,7 @@ impl ResidualVectorQuantizer {
 ///
 /// Variant that splits quantizers into semantic (first N) and acoustic groups,
 /// commonly used in speech codecs.
+#[allow(dead_code)]
 pub struct SplitResidualVectorQuantizer {
     /// Semantic quantizers (typically 1)
     semantic_quantizers: ResidualVectorQuantizer,
@@ -217,6 +218,7 @@ pub struct SplitResidualVectorQuantizer {
     num_semantic: usize,
 }
 
+#[allow(dead_code)]
 impl SplitResidualVectorQuantizer {
     /// Create new split RVQ
     pub fn new(
@@ -226,19 +228,11 @@ impl SplitResidualVectorQuantizer {
         dim: usize,
         vb: VarBuilder,
     ) -> Result<Self> {
-        let semantic_quantizers = ResidualVectorQuantizer::new(
-            num_semantic,
-            codebook_size,
-            dim,
-            vb.pp("semantic"),
-        )?;
+        let semantic_quantizers =
+            ResidualVectorQuantizer::new(num_semantic, codebook_size, dim, vb.pp("semantic"))?;
 
-        let acoustic_quantizers = ResidualVectorQuantizer::new(
-            num_acoustic,
-            codebook_size,
-            dim,
-            vb.pp("acoustic"),
-        )?;
+        let acoustic_quantizers =
+            ResidualVectorQuantizer::new(num_acoustic, codebook_size, dim, vb.pp("acoustic"))?;
 
         Ok(Self {
             semantic_quantizers,
@@ -268,7 +262,7 @@ impl SplitResidualVectorQuantizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
+    use candle_core::{DType, Device};
     use candle_nn::VarMap;
 
     /// Create a VarBuilder with mock weights for testing
@@ -399,7 +393,9 @@ mod tests {
         let semantic_indices = Tensor::zeros((2, 1, 3), DType::U32, &device).unwrap();
         let acoustic_indices = Tensor::zeros((2, 15, 3), DType::U32, &device).unwrap();
 
-        let decoded = split_rvq.decode(&semantic_indices, &acoustic_indices).unwrap();
+        let decoded = split_rvq
+            .decode(&semantic_indices, &acoustic_indices)
+            .unwrap();
         assert_eq!(decoded.dims(), &[2, 3, 64]);
     }
 
@@ -447,6 +443,9 @@ mod tests {
                 break;
             }
         }
-        assert!(any_diff, "Different indices should decode to different embeddings");
+        assert!(
+            any_diff,
+            "Different indices should decode to different embeddings"
+        );
     }
 }

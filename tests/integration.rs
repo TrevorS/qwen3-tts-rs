@@ -12,7 +12,7 @@ fn create_mock_vb(device: &Device) -> VarBuilder<'static> {
 }
 
 mod audio_tests {
-    use qwen3_tts::audio::{AudioBuffer, MelConfig, MelSpectrogram, resample};
+    use qwen3_tts::audio::{resample, AudioBuffer, MelConfig, MelSpectrogram};
     use std::f32::consts::PI;
 
     #[test]
@@ -99,7 +99,7 @@ mod tokenizer_tests {
             .unwrap();
 
         let mut tokenizer = Tokenizer::new(bpe);
-        tokenizer.with_pre_tokenizer(Some(Whitespace::default()));
+        tokenizer.with_pre_tokenizer(Some(Whitespace));
 
         TextTokenizer::from_tokenizer(tokenizer).unwrap()
     }
@@ -121,9 +121,9 @@ mod tokenizer_tests {
     fn test_tokenizer_special_tokens() {
         let tokenizer = create_test_tokenizer();
 
-        assert_eq!(tokenizer.bos_token_id, 3);  // <|im_start|>
-        assert_eq!(tokenizer.eos_token_id, 4);  // <|im_end|>
-        assert_eq!(tokenizer.pad_token_id, 5);  // <|endoftext|>
+        assert_eq!(tokenizer.bos_token_id, 3); // <|im_start|>
+        assert_eq!(tokenizer.eos_token_id, 4); // <|im_end|>
+        assert_eq!(tokenizer.pad_token_id, 5); // <|endoftext|>
     }
 
     #[test]
@@ -141,8 +141,8 @@ mod tokenizer_tests {
 mod model_tests {
     use super::*;
     use qwen3_tts::models::{
+        codec::{presets, CodecDecoder, DecoderConfig},
         Qwen3TTSConfig, Qwen3TTSModel,
-        codec::{CodecDecoder, DecoderConfig, presets},
     };
 
     fn small_config() -> Qwen3TTSConfig {
@@ -175,10 +175,9 @@ mod model_tests {
     #[test]
     fn test_kv_cache_creation() {
         let config = small_config();
-        let kv_caches: Vec<qwen3_tts::models::qwen3_tts::KVCache> =
-            (0..config.num_hidden_layers)
-                .map(|_| qwen3_tts::models::qwen3_tts::KVCache::new())
-                .collect();
+        let kv_caches: Vec<qwen3_tts::models::qwen3_tts::KVCache> = (0..config.num_hidden_layers)
+            .map(|_| qwen3_tts::models::qwen3_tts::KVCache::new())
+            .collect();
 
         assert_eq!(kv_caches.len(), config.num_hidden_layers);
     }
@@ -218,7 +217,9 @@ mod model_tests {
 
 mod generation_tests {
     use super::*;
-    use qwen3_tts::generation::{GenerationConfig, sample, greedy_sample, apply_repetition_penalty};
+    use qwen3_tts::generation::{
+        apply_repetition_penalty, greedy_sample, sample, GenerationConfig,
+    };
 
     #[test]
     fn test_greedy_sampling() {
@@ -260,8 +261,7 @@ mod generation_tests {
 }
 
 mod end_to_end_mock {
-    use super::*;
-    use qwen3_tts::{Qwen3TTSConfig, AudioBuffer, SynthesisOptions};
+    use qwen3_tts::{AudioBuffer, Qwen3TTSConfig, SynthesisOptions};
 
     #[test]
     fn test_synthesis_options_configuration() {
@@ -273,10 +273,12 @@ mod end_to_end_mock {
             repetition_penalty: 1.1,
             speaker_embedding: None,
             language: Some("en".to_string()),
+            eos_token_id: Some(151670), // audio_end token
         };
 
         assert_eq!(options.max_length, 512);
         assert!((options.temperature - 0.8).abs() < 1e-6);
+        assert_eq!(options.eos_token_id, Some(151670));
     }
 
     #[test]
@@ -465,7 +467,9 @@ mod speech_tokenizer_tests {
     const SPEECH_TOKENIZER_DIR: &str = "test_data/speech_tokenizer";
 
     fn speech_tokenizer_available() -> bool {
-        Path::new(SPEECH_TOKENIZER_DIR).join("model.safetensors").exists()
+        Path::new(SPEECH_TOKENIZER_DIR)
+            .join("model.safetensors")
+            .exists()
     }
 
     #[test]
@@ -543,7 +547,8 @@ mod speech_tokenizer_tests {
         let tensors = SafeTensors::deserialize(&model_bytes).unwrap();
 
         // Find encoder embedding weights
-        let encoder_tensors: Vec<&String> = tensors.names()
+        let encoder_tensors: Vec<&String> = tensors
+            .names()
             .iter()
             .filter(|n| n.starts_with("encoder."))
             .cloned()
@@ -573,7 +578,8 @@ mod speech_tokenizer_tests {
         let tensors = SafeTensors::deserialize(&model_bytes).unwrap();
 
         // Find decoder weights
-        let decoder_tensors: Vec<&String> = tensors.names()
+        let decoder_tensors: Vec<&String> = tensors
+            .names()
             .iter()
             .filter(|n| n.starts_with("decoder."))
             .cloned()
@@ -610,14 +616,20 @@ mod speech_tokenizer_tests {
             .cloned()
             .collect();
 
-        println!("Found {} quantizer/codebook tensors:", codebook_tensors.len());
+        println!(
+            "Found {} quantizer/codebook tensors:",
+            codebook_tensors.len()
+        );
         for name in &codebook_tensors {
             let tensor = tensors.tensor(name).unwrap();
             println!("  {}: {:?}", name, tensor.shape());
         }
 
         // Should have quantization-related weights
-        assert!(!codebook_tensors.is_empty(), "Should have quantizer weights");
+        assert!(
+            !codebook_tensors.is_empty(),
+            "Should have quantizer weights"
+        );
     }
 
     #[test]
@@ -664,7 +676,11 @@ mod speech_tokenizer_tests {
 
         // Verify tensor shapes are valid
         for (name, tensor) in &tensors {
-            assert!(!tensor.dims().is_empty(), "Tensor {} should have valid shape", name);
+            assert!(
+                !tensor.dims().is_empty(),
+                "Tensor {} should have valid shape",
+                name
+            );
         }
     }
 }
@@ -677,7 +693,9 @@ mod model_config_tests {
     const MODEL_CONFIG_DIR: &str = "test_data/model_config";
 
     fn model_config_available() -> bool {
-        Path::new(MODEL_CONFIG_DIR).join("generation_config.json").exists()
+        Path::new(MODEL_CONFIG_DIR)
+            .join("generation_config.json")
+            .exists()
     }
 
     #[test]
@@ -782,7 +800,9 @@ mod model_config_tests {
     #[test]
     fn test_tokenizer_config_additional_special_tokens() {
         if !model_config_available() {
-            eprintln!("Skipping test_tokenizer_config_additional_special_tokens: test data not found");
+            eprintln!(
+                "Skipping test_tokenizer_config_additional_special_tokens: test data not found"
+            );
             return;
         }
 
@@ -791,7 +811,8 @@ mod model_config_tests {
         let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
 
         let additional_tokens = config["additional_special_tokens"].as_array().unwrap();
-        let tokens: Vec<&str> = additional_tokens.iter()
+        let tokens: Vec<&str> = additional_tokens
+            .iter()
             .map(|t| t.as_str().unwrap())
             .collect();
 
@@ -848,8 +869,8 @@ mod model_config_tests {
 
 /// Tests for the 0.6B model weights
 mod model_weights_tests {
-    use std::path::Path;
     use std::collections::HashMap;
+    use std::path::Path;
 
     const MODEL_DIR: &str = "test_data/model";
 
@@ -919,7 +940,8 @@ mod model_weights_tests {
         let tensors = SafeTensors::deserialize(&model_bytes).unwrap();
 
         // Explore talker structure - find unique 2nd-level prefixes
-        let mut sub_components: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut sub_components: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for name in tensors.names() {
             if name.starts_with("talker.") {
                 let parts: Vec<&str> = name.split('.').collect();
@@ -932,7 +954,8 @@ mod model_weights_tests {
         println!("Talker sub-components: {:?}", sub_components);
 
         // Find layer tensors - the model uses "talker.model.layers." structure
-        let layer_tensors: Vec<&String> = tensors.names()
+        let layer_tensors: Vec<&String> = tensors
+            .names()
             .iter()
             .filter(|n| n.contains(".layers."))
             .cloned()
@@ -979,7 +1002,8 @@ mod model_weights_tests {
         let tensors = SafeTensors::deserialize(&model_bytes).unwrap();
 
         // Find embedding tensor
-        let embed_names: Vec<&String> = tensors.names()
+        let embed_names: Vec<&String> = tensors
+            .names()
             .iter()
             .filter(|n| n.contains("embed") && n.contains("token"))
             .cloned()
@@ -1056,7 +1080,8 @@ mod model_weights_tests {
         let tensors = SafeTensors::deserialize(&model_bytes).unwrap();
 
         // Find speaker encoder tensors
-        let speaker_tensors: Vec<&String> = tensors.names()
+        let speaker_tensors: Vec<&String> = tensors
+            .names()
             .iter()
             .filter(|n| n.contains("speaker"))
             .cloned()
@@ -1068,7 +1093,10 @@ mod model_weights_tests {
             println!("  {}: {:?}", name, tensor.shape());
         }
 
-        assert!(!speaker_tensors.is_empty(), "Should have speaker encoder weights");
+        assert!(
+            !speaker_tensors.is_empty(),
+            "Should have speaker encoder weights"
+        );
     }
 
     #[test]
@@ -1085,7 +1113,8 @@ mod model_weights_tests {
         let tensors = SafeTensors::deserialize(&model_bytes).unwrap();
 
         // Find code embedding tensors (for audio tokens)
-        let code_embed_names: Vec<&String> = tensors.names()
+        let code_embed_names: Vec<&String> = tensors
+            .names()
             .iter()
             .filter(|n| n.contains("code") && n.contains("embed"))
             .cloned()
@@ -1115,7 +1144,8 @@ mod model_weights_tests {
         let tensors = SafeTensors::deserialize(&model_bytes).unwrap();
 
         // Find LM head / output projection
-        let lm_head_names: Vec<&String> = tensors.names()
+        let lm_head_names: Vec<&String> = tensors
+            .names()
             .iter()
             .filter(|n| n.contains("lm_head") || n.contains("output"))
             .cloned()

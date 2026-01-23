@@ -1,7 +1,7 @@
 //! Token sampling strategies for autoregressive generation
 
 use anyhow::Result;
-use candle_core::{DType, Device, IndexOp, Tensor, D};
+use candle_core::{DType, IndexOp, Tensor, D};
 
 /// Configuration for autoregressive generation
 #[derive(Debug, Clone)]
@@ -16,6 +16,8 @@ pub struct GenerationConfig {
     pub top_p: f64,
     /// Repetition penalty (1.0 = no penalty)
     pub repetition_penalty: f64,
+    /// End-of-sequence token ID (generation stops when this token is sampled)
+    pub eos_token_id: Option<u32>,
 }
 
 impl Default for GenerationConfig {
@@ -26,6 +28,7 @@ impl Default for GenerationConfig {
             top_k: 50,
             top_p: 0.9,
             repetition_penalty: 1.0,
+            eos_token_id: None,
         }
     }
 }
@@ -88,11 +91,8 @@ fn multinomial_sample(probs: &Tensor) -> Result<Tensor> {
     let cumsum = cumulative_sum(probs)?;
 
     // Generate uniform random values
-    let uniform: Vec<f32> = (0..batch)
-        .map(|_| rand_f32())
-        .collect();
-    let uniform = Tensor::new(uniform.as_slice(), probs.device())?
-        .unsqueeze(1)?;
+    let uniform: Vec<f32> = (0..batch).map(|_| rand_f32()).collect();
+    let uniform = Tensor::new(uniform.as_slice(), probs.device())?.unsqueeze(1)?;
 
     // Find first index where cumsum >= uniform
     let mask = cumsum.ge(&uniform.broadcast_as(cumsum.shape())?)?;
@@ -107,8 +107,8 @@ fn multinomial_sample(probs: &Tensor) -> Result<Tensor> {
         .broadcast_as(mask_f32.shape())?;
 
     // Where mask is true, use position; else use large value
-    let large = Tensor::new(&[vocab as f32 + 1.0], probs.device())?
-        .broadcast_as(mask_f32.shape())?;
+    let large =
+        Tensor::new(&[vocab as f32 + 1.0], probs.device())?.broadcast_as(mask_f32.shape())?;
     let masked_positions = mask.where_cond(&positions, &large)?;
 
     // Argmin gives first True position
@@ -117,8 +117,8 @@ fn multinomial_sample(probs: &Tensor) -> Result<Tensor> {
 
 /// Generate a random f32 in [0, 1)
 fn rand_f32() -> f32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -129,7 +129,10 @@ fn rand_f32() -> f32 {
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
 
     // LCG with seed and counter
-    let state = seed.wrapping_add(count).wrapping_mul(1103515245).wrapping_add(12345);
+    let state = seed
+        .wrapping_add(count)
+        .wrapping_mul(1103515245)
+        .wrapping_add(12345);
     (state as f32) / (u64::MAX as f32)
 }
 
@@ -173,6 +176,7 @@ pub fn greedy_sample(logits: &Tensor) -> Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::Device;
 
     #[test]
     fn test_generation_config_default() {
@@ -182,6 +186,7 @@ mod tests {
         assert_eq!(config.top_k, 50);
         assert!((config.top_p - 0.9).abs() < 1e-6);
         assert!((config.repetition_penalty - 1.0).abs() < 1e-6);
+        assert_eq!(config.eos_token_id, None);
     }
 
     #[test]
@@ -192,10 +197,12 @@ mod tests {
             top_k: 10,
             top_p: 0.8,
             repetition_penalty: 1.2,
+            eos_token_id: Some(151670),
         };
         assert_eq!(config.max_new_tokens, 512);
         assert!((config.temperature - 0.5).abs() < 1e-6);
         assert_eq!(config.top_k, 10);
+        assert_eq!(config.eos_token_id, Some(151670));
     }
 
     #[test]
@@ -213,7 +220,11 @@ mod tests {
     #[test]
     fn test_cumulative_sum_batch() {
         let device = Device::Cpu;
-        let x = Tensor::new(&[[0.25f32, 0.25, 0.25, 0.25], [0.1, 0.2, 0.3, 0.4]], &device).unwrap();
+        let x = Tensor::new(
+            &[[0.25f32, 0.25, 0.25, 0.25], [0.1, 0.2, 0.3, 0.4]],
+            &device,
+        )
+        .unwrap();
         let cumsum = cumulative_sum(&x).unwrap();
         let result: Vec<f32> = cumsum.flatten_all().unwrap().to_vec1().unwrap();
         // First row
@@ -314,7 +325,7 @@ mod tests {
         let penalized: Vec<f32> = result.flatten_all().unwrap().to_vec1().unwrap();
         // Token 0 had positive logit, should be divided by penalty
         assert!((penalized[0] - 1.0).abs() < 1e-5); // 2.0 / 2.0 = 1.0
-        // Others unchanged
+                                                    // Others unchanged
         assert!((penalized[1] - 3.0).abs() < 1e-5);
         assert!((penalized[2] - 4.0).abs() < 1e-5);
     }
@@ -363,11 +374,7 @@ mod tests {
     #[test]
     fn test_sample_with_batch() {
         let device = Device::Cpu;
-        let logits = Tensor::new(
-            &[[10.0f32, 1.0, 1.0], [1.0, 10.0, 1.0]],
-            &device,
-        )
-        .unwrap();
+        let logits = Tensor::new(&[[10.0f32, 1.0, 1.0], [1.0, 10.0, 1.0]], &device).unwrap();
         let config = GenerationConfig {
             temperature: 0.001, // Very low temp for deterministic
             ..Default::default()

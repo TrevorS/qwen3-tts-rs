@@ -3,10 +3,9 @@
 //! This implements the "Talker" model that generates audio codec tokens
 //! from text input autoregressively.
 
-use anyhow::{Context, Result};
-use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
-use candle_nn::{embedding, linear, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
-use std::sync::Arc;
+use anyhow::Result;
+use candle_core::{Device, IndexOp, Module, Tensor, D};
+use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
 
 use super::config::Qwen3TTSConfig;
 use crate::generation::GenerationConfig;
@@ -15,6 +14,7 @@ use crate::generation::GenerationConfig;
 pub struct RotaryEmbedding {
     cos: Tensor,
     sin: Tensor,
+    #[allow(dead_code)]
     dim: usize,
 }
 
@@ -53,26 +53,35 @@ impl RotaryEmbedding {
         let x2 = x.narrow(D::Minus1, d / 2, d / 2)?;
 
         // Broadcast cos/sin to match x dimensions
+        // cos/sin are [seq_len, head_dim/2], need [1, 1, seq_len, head_dim/2]
         let cos = cos.unsqueeze(0)?.unsqueeze(0)?;
         let sin = sin.unsqueeze(0)?.unsqueeze(0)?;
         let cos = cos.broadcast_as(x1.shape())?;
         let sin = sin.broadcast_as(x1.shape())?;
 
-        let rotated = Tensor::cat(&[
-            &(x1.mul(&cos)? - x2.mul(&sin)?)?,
-            &(x1.mul(&sin)? + x2.mul(&cos)?)?,
-        ], D::Minus1)?;
+        // Standard RoPE: x * cos + rotate_half(x) * sin
+        // where rotate_half([x1, x2]) = [-x2, x1]
+        // Result: [x1*cos - x2*sin, x2*cos + x1*sin]
+        let rotated = Tensor::cat(
+            &[
+                &(x1.mul(&cos)? - x2.mul(&sin)?)?,
+                &(x2.mul(&cos)? + x1.mul(&sin)?)?,
+            ],
+            D::Minus1,
+        )?;
 
         Ok(rotated)
     }
 }
 
-/// Multi-head attention with grouped-query attention support
+/// Multi-head attention with grouped-query attention and QK normalization
 pub struct Attention {
     q_proj: Linear,
     k_proj: Linear,
     v_proj: Linear,
     o_proj: Linear,
+    q_norm: RmsNorm,
+    k_norm: RmsNorm,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -91,11 +100,17 @@ impl Attention {
         let v_proj = linear_no_bias(hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?;
         let o_proj = linear_no_bias(num_heads * head_dim, hidden_size, vb.pp("o_proj"))?;
 
+        // QK normalization: RMSNorm applied per-head after projection
+        let q_norm = rms_norm(head_dim, config.rms_norm_eps, vb.pp("q_norm"))?;
+        let k_norm = rms_norm(head_dim, config.rms_norm_eps, vb.pp("k_norm"))?;
+
         Ok(Self {
             q_proj,
             k_proj,
             v_proj,
             o_proj,
+            q_norm,
+            k_norm,
             num_heads,
             num_kv_heads,
             head_dim,
@@ -118,13 +133,19 @@ impl Attention {
         let k = self.k_proj.forward(hidden_states)?;
         let v = self.v_proj.forward(hidden_states)?;
 
-        // Reshape to [batch, heads, seq, head_dim]
-        let q = q.reshape((batch, seq_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k.reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v.reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
+        // Reshape to [batch, seq, heads, head_dim] for QK norm
+        let q = q.reshape((batch, seq_len, self.num_heads, self.head_dim))?;
+        let k = k.reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?;
+        let v = v.reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?;
+
+        // Apply QK normalization (per-head RMSNorm)
+        let q = self.q_norm.forward(&q)?;
+        let k = self.k_norm.forward(&k)?;
+
+        // Transpose to [batch, heads, seq, head_dim]
+        let q = q.transpose(1, 2)?;
+        let k = k.transpose(1, 2)?;
+        let v = v.transpose(1, 2)?;
 
         // Apply rotary embeddings
         let (q, k) = rope.apply(&q, &k, offset)?;
@@ -146,7 +167,7 @@ impl Attention {
         let attn_weights = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * self.scale)?;
 
         let attn_weights = if let Some(mask) = attention_mask {
-            (attn_weights + mask)?
+            attn_weights.broadcast_add(mask)?
         } else {
             attn_weights
         };
@@ -155,9 +176,11 @@ impl Attention {
         let attn_output = attn_weights.matmul(&v)?;
 
         // Reshape back
-        let attn_output = attn_output
-            .transpose(1, 2)?
-            .reshape((batch, seq_len, self.num_heads * self.head_dim))?;
+        let attn_output = attn_output.transpose(1, 2)?.reshape((
+            batch,
+            seq_len,
+            self.num_heads * self.head_dim,
+        ))?;
 
         Ok(self.o_proj.forward(&attn_output)?)
     }
@@ -169,7 +192,8 @@ impl Attention {
         }
 
         let (batch, num_kv_heads, seq_len, head_dim) = x.dims4()?;
-        let x = x.unsqueeze(2)?
+        let x = x
+            .unsqueeze(2)?
             .expand((batch, num_kv_heads, n_rep, seq_len, head_dim))?
             .reshape((batch, num_kv_heads * n_rep, seq_len, head_dim))?;
         Ok(x)
@@ -216,7 +240,11 @@ impl DecoderLayer {
         Ok(Self {
             self_attn: Attention::new(config, vb.pp("self_attn"))?,
             mlp: MLP::new(config, vb.pp("mlp"))?,
-            input_layernorm: rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("input_layernorm"))?,
+            input_layernorm: rms_norm(
+                config.hidden_size,
+                config.rms_norm_eps,
+                vb.pp("input_layernorm"),
+            )?,
             post_attention_layernorm: rms_norm(
                 config.hidden_size,
                 config.rms_norm_eps,
@@ -236,13 +264,9 @@ impl DecoderLayer {
         // Self-attention with residual
         let residual = hidden_states;
         let hidden_states = self.input_layernorm.forward(hidden_states)?;
-        let hidden_states = self.self_attn.forward(
-            &hidden_states,
-            rope,
-            attention_mask,
-            kv_cache,
-            offset,
-        )?;
+        let hidden_states =
+            self.self_attn
+                .forward(&hidden_states, rope, attention_mask, kv_cache, offset)?;
         let hidden_states = (residual + hidden_states)?;
 
         // MLP with residual
@@ -259,6 +283,12 @@ impl DecoderLayer {
 pub struct KVCache {
     k: Option<Tensor>,
     v: Option<Tensor>,
+}
+
+impl Default for KVCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl KVCache {
@@ -299,6 +329,7 @@ pub struct Qwen3TTSModel {
     norm: RmsNorm,
     lm_head: Linear,
     rope: RotaryEmbedding,
+    #[allow(dead_code)]
     config: Qwen3TTSConfig,
     device: Device,
 }
@@ -307,26 +338,30 @@ impl Qwen3TTSModel {
     /// Load model from pretrained weights
     pub fn from_pretrained(
         model_id: &str,
-        config: &Qwen3TTSConfig,
-        device: &Device,
+        _config: &Qwen3TTSConfig,
+        _device: &Device,
     ) -> Result<Self> {
         // TODO: Implement weight loading from safetensors
         // For now, just return uninitialized error
-        anyhow::bail!(
-            "Weight loading not yet implemented. Model ID: {}",
-            model_id
-        )
+        anyhow::bail!("Weight loading not yet implemented. Model ID: {}", model_id)
     }
 
     /// Create model with given weights
     pub fn new(config: Qwen3TTSConfig, vb: VarBuilder) -> Result<Self> {
         let device = vb.device().clone();
 
-        let embed_tokens = embedding(config.vocab_size, config.hidden_size, vb.pp("model.embed_tokens"))?;
+        let embed_tokens = embedding(
+            config.vocab_size,
+            config.hidden_size,
+            vb.pp("model.embed_tokens"),
+        )?;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
-            layers.push(DecoderLayer::new(&config, vb.pp(format!("model.layers.{}", i)))?);
+            layers.push(DecoderLayer::new(
+                &config,
+                vb.pp(format!("model.layers.{}", i)),
+            )?);
         }
 
         let norm = rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("model.norm"))?;
@@ -381,13 +416,11 @@ impl Qwen3TTSModel {
     pub fn generate(
         &self,
         input_ids: &Tensor,
-        speaker_embedding: Option<&Tensor>,
+        _speaker_embedding: Option<&Tensor>,
         config: &GenerationConfig,
     ) -> Result<Tensor> {
-        let batch_size = input_ids.dim(0)?;
-        let mut kv_caches: Vec<KVCache> = (0..self.layers.len())
-            .map(|_| KVCache::new())
-            .collect();
+        let _batch_size = input_ids.dim(0)?;
+        let mut kv_caches: Vec<KVCache> = (0..self.layers.len()).map(|_| KVCache::new()).collect();
 
         // Process input prompt
         let mut logits = self.forward(input_ids, &mut kv_caches, 0)?;
@@ -402,8 +435,13 @@ impl Qwen3TTSModel {
             // Sample next token
             let next_token = crate::generation::sample(&last_logits, config)?;
 
-            // Check for EOS
-            // TODO: Implement proper EOS detection
+            // Check for EOS - stop if all sequences in batch have generated EOS
+            if let Some(eos_id) = config.eos_token_id {
+                let token_ids: Vec<u32> = next_token.flatten_all()?.to_vec1()?;
+                if token_ids.iter().all(|&t| t == eos_id) {
+                    break;
+                }
+            }
 
             // Append to generated sequence
             let next_token = next_token.unsqueeze(1)?;
@@ -431,14 +469,14 @@ impl Qwen3TTSModel {
             })
             .collect();
 
-        Ok(Tensor::new(mask.as_slice(), &self.device)?
-            .reshape((1, 1, seq_len, total_len))?)
+        Ok(Tensor::new(mask.as_slice(), &self.device)?.reshape((1, 1, seq_len, total_len))?)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::DType;
     use candle_nn::VarMap;
 
     fn create_mock_vb(device: &Device) -> VarBuilder<'static> {
@@ -600,11 +638,15 @@ mod tests {
 
         // First forward
         let input1 = Tensor::randn(0.0f32, 1.0, (1, 5, 64), &device).unwrap();
-        let _out1 = attn.forward(&input1, &rope, None, Some(&mut cache), 0).unwrap();
+        let _out1 = attn
+            .forward(&input1, &rope, None, Some(&mut cache), 0)
+            .unwrap();
 
         // Second forward with cache
         let input2 = Tensor::randn(0.0f32, 1.0, (1, 3, 64), &device).unwrap();
-        let out2 = attn.forward(&input2, &rope, None, Some(&mut cache), 5).unwrap();
+        let out2 = attn
+            .forward(&input2, &rope, None, Some(&mut cache), 5)
+            .unwrap();
 
         assert_eq!(out2.dims(), &[1, 3, 64]);
     }
@@ -620,7 +662,9 @@ mod tests {
         let mut cache = KVCache::new();
 
         let input = Tensor::randn(0.0f32, 1.0, (1, 8, 64), &device).unwrap();
-        let output = layer.forward(&input, &rope, None, Some(&mut cache), 0).unwrap();
+        let output = layer
+            .forward(&input, &rope, None, Some(&mut cache), 0)
+            .unwrap();
 
         assert_eq!(output.dims(), &[1, 8, 64]);
     }

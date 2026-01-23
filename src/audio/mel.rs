@@ -6,7 +6,7 @@
 use anyhow::Result;
 use candle_core::{Device, Tensor};
 use num_complex::Complex;
-use rustfft::{FftPlanner, num_complex::Complex as FftComplex};
+use rustfft::{num_complex::Complex as FftComplex, FftPlanner};
 use std::f32::consts::PI;
 
 /// Configuration for mel spectrogram computation
@@ -84,9 +84,7 @@ impl MelSpectrogram {
         // Compute power spectrogram
         let power_spec: Vec<Vec<f32>> = stft
             .iter()
-            .map(|frame| {
-                frame.iter().map(|c| c.norm_sqr()).collect()
-            })
+            .map(|frame| frame.iter().map(|c| c.norm_sqr()).collect())
             .collect();
 
         // Apply mel filterbank
@@ -112,12 +110,7 @@ impl MelSpectrogram {
     pub fn compute_log(&self, samples: &[f32]) -> Vec<Vec<f32>> {
         let mel = self.compute(samples);
         mel.into_iter()
-            .map(|frame| {
-                frame
-                    .into_iter()
-                    .map(|v| (v.max(1e-10)).ln())
-                    .collect()
-            })
+            .map(|frame| frame.into_iter().map(|v| (v.max(1e-10)).ln()).collect())
             .collect()
     }
 
@@ -142,7 +135,7 @@ impl MelSpectrogram {
 
         for i in 0..n_frames {
             let start = i * hop_length;
-            let end = start + n_fft;
+            let _end = start + n_fft;
 
             // Apply window and prepare FFT input
             let mut buffer: Vec<FftComplex<f32>> = (0..n_fft)
@@ -179,13 +172,7 @@ impl MelSpectrogram {
             .map(|frame| {
                 self.mel_basis
                     .iter()
-                    .map(|filter| {
-                        filter
-                            .iter()
-                            .zip(frame.iter())
-                            .map(|(f, p)| f * p)
-                            .sum()
-                    })
+                    .map(|filter| filter.iter().zip(frame.iter()).map(|(f, p)| f * p).sum())
                     .collect()
             })
             .collect()
@@ -230,16 +217,23 @@ impl MelSpectrogram {
             let right = bin_points[i + 2];
 
             // Rising slope
-            for j in left..center {
+            let rising_denom = (center - left).max(1) as f32;
+            for (j, val) in filterbank[i].iter_mut().enumerate().take(center).skip(left) {
                 if j < n_freqs {
-                    filterbank[i][j] = (j - left) as f32 / (center - left).max(1) as f32;
+                    *val = (j - left) as f32 / rising_denom;
                 }
             }
 
             // Falling slope
-            for j in center..right {
+            let falling_denom = (right - center).max(1) as f32;
+            for (j, val) in filterbank[i]
+                .iter_mut()
+                .enumerate()
+                .take(right)
+                .skip(center)
+            {
                 if j < n_freqs {
-                    filterbank[i][j] = (right - j) as f32 / (right - center).max(1) as f32;
+                    *val = (right - j) as f32 / falling_denom;
                 }
             }
         }
@@ -352,9 +346,7 @@ mod tests {
         let result = mel.compute(&samples);
         assert!(!result.is_empty());
         // Should have non-zero energy
-        let total_energy: f32 = result.iter()
-            .flat_map(|frame| frame.iter())
-            .sum();
+        let total_energy: f32 = result.iter().flat_map(|frame| frame.iter()).sum();
         assert!(total_energy > 0.0);
     }
 
@@ -367,7 +359,8 @@ mod tests {
         let result = mel.compute_log(&samples);
         assert!(!result.is_empty());
         // Log mel should have negative values (log of small numbers)
-        let has_negative = result.iter()
+        let has_negative = result
+            .iter()
             .flat_map(|frame| frame.iter())
             .any(|&v| v < 0.0);
         assert!(has_negative);
@@ -393,6 +386,6 @@ mod tests {
         // With padding, number of frames should be predictable
         let samples = vec![0.0f32; 1600]; // 10 hops
         let result = mel.compute(&samples);
-        assert!(result.len() > 0);
+        assert!(!result.is_empty());
     }
 }

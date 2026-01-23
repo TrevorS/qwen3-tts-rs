@@ -3,8 +3,11 @@
 //! Converts discrete codec tokens back to audio waveforms.
 
 use anyhow::Result;
-use candle_core::{DType, Device, Module, Tensor, D};
-use candle_nn::{conv1d, conv_transpose1d, linear, rms_norm, Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, Linear, RmsNorm, VarBuilder};
+use candle_core::{Device, Module, Tensor, D};
+use candle_nn::{
+    conv1d, conv_transpose1d, linear, rms_norm, Conv1d, Conv1dConfig, ConvTranspose1d,
+    ConvTranspose1dConfig, Linear, RmsNorm, VarBuilder,
+};
 
 use super::quantizer::ResidualVectorQuantizer;
 
@@ -66,7 +69,13 @@ impl UpsampleBlock {
         };
 
         Ok(Self {
-            conv: conv_transpose1d(in_channels, out_channels, kernel_size, config, vb.pp("conv"))?,
+            conv: conv_transpose1d(
+                in_channels,
+                out_channels,
+                kernel_size,
+                config,
+                vb.pp("conv"),
+            )?,
             activation: true,
         })
     }
@@ -151,13 +160,19 @@ impl DecoderAttention {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (batch, seq_len, hidden) = x.dims3()?;
 
-        let q = self.q_proj.forward(x)?
+        let q = self
+            .q_proj
+            .forward(x)?
             .reshape((batch, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let k = self.k_proj.forward(x)?
+        let k = self
+            .k_proj
+            .forward(x)?
             .reshape((batch, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let v = self.v_proj.forward(x)?
+        let v = self
+            .v_proj
+            .forward(x)?
             .reshape((batch, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
 
@@ -166,8 +181,7 @@ impl DecoderAttention {
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
         let out = attn.matmul(&v)?;
 
-        let out = out.transpose(1, 2)?
-            .reshape((batch, seq_len, hidden))?;
+        let out = out.transpose(1, 2)?.reshape((batch, seq_len, hidden))?;
 
         Ok(self.o_proj.forward(&out)?)
     }
@@ -215,6 +229,7 @@ impl DecoderTransformerLayer {
 
 /// Main codec decoder
 pub struct CodecDecoder {
+    #[allow(dead_code)]
     config: DecoderConfig,
     /// Vector quantizer for codebook lookups
     quantizer: ResidualVectorQuantizer,
@@ -230,6 +245,7 @@ pub struct CodecDecoder {
     residual_blocks: Vec<Vec<ResidualBlock>>,
     /// Final convolution to audio
     final_conv: Conv1d,
+    #[allow(dead_code)]
     device: Device,
 }
 
@@ -297,7 +313,10 @@ impl CodecDecoder {
             channels,
             config.out_channels,
             7,
-            Conv1dConfig { padding: 3, ..Default::default() },
+            Conv1dConfig {
+                padding: 3,
+                ..Default::default()
+            },
             vb.pp("final_conv"),
         )?;
 
@@ -357,6 +376,7 @@ impl CodecDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::DType;
     use candle_nn::VarMap;
 
     fn create_mock_vb(device: &Device) -> VarBuilder<'static> {
@@ -500,8 +520,10 @@ mod tests {
         let block = UpsampleBlock::new(32, 16, 4, 2, vb).unwrap();
 
         // Input with negative values
-        let input = Tensor::new(&[[[- 1.0f32, 1.0, -2.0, 2.0]]], &device).unwrap()
-            .broadcast_as((1, 32, 4)).unwrap();
+        let input = Tensor::new(&[[[-1.0f32, 1.0, -2.0, 2.0]]], &device)
+            .unwrap()
+            .broadcast_as((1, 32, 4))
+            .unwrap();
         let output = block.forward(&input).unwrap();
 
         // Just check it runs without error
@@ -516,10 +538,22 @@ mod tests {
 
         // Create input with known magnitude
         let input = Tensor::randn(0.0f32, 1.0, (1, 32, 10), &device).unwrap();
-        let input_mean: f32 = input.abs().unwrap().mean_all().unwrap().to_scalar().unwrap();
+        let input_mean: f32 = input
+            .abs()
+            .unwrap()
+            .mean_all()
+            .unwrap()
+            .to_scalar()
+            .unwrap();
 
         let output = block.forward(&input).unwrap();
-        let output_mean: f32 = output.abs().unwrap().mean_all().unwrap().to_scalar().unwrap();
+        let output_mean: f32 = output
+            .abs()
+            .unwrap()
+            .mean_all()
+            .unwrap()
+            .to_scalar()
+            .unwrap();
 
         // Output should have similar magnitude due to residual (not be zero or explode)
         assert!(output_mean > 0.0);

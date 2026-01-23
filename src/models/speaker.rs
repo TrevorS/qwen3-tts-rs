@@ -7,7 +7,7 @@
 //! The full ECAPA-TDNN would require more complex batch normalization handling.
 
 use anyhow::Result;
-use candle_core::{DType, Device, Module, Tensor, D};
+use candle_core::{Device, Module, Tensor, D};
 use candle_nn::{conv1d, linear, Conv1d, Conv1dConfig, Linear, VarBuilder};
 
 use crate::audio::{AudioBuffer, MelConfig, MelSpectrogram};
@@ -82,14 +82,25 @@ pub struct TDNNBlock {
 }
 
 impl TDNNBlock {
-    pub fn new(in_channels: usize, out_channels: usize, kernel_size: usize, vb: VarBuilder) -> Result<Self> {
+    pub fn new(
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         let conv_config = Conv1dConfig {
             padding: kernel_size / 2,
             ..Default::default()
         };
 
         Ok(Self {
-            conv: conv1d(in_channels, out_channels, kernel_size, conv_config, vb.pp("conv"))?,
+            conv: conv1d(
+                in_channels,
+                out_channels,
+                kernel_size,
+                conv_config,
+                vb.pp("conv"),
+            )?,
             se: SEBlock::new(out_channels, 8, vb.pp("se"))?,
         })
     }
@@ -97,7 +108,7 @@ impl TDNNBlock {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let out = self.conv.forward(x)?;
         let out = relu(&out)?;
-        Ok(self.se.forward(&out)?)
+        self.se.forward(&out)
     }
 }
 
@@ -137,6 +148,7 @@ impl AttentiveStatisticsPooling {
 
 /// Simplified ECAPA-TDNN speaker encoder
 pub struct SpeakerEncoder {
+    #[allow(dead_code)]
     config: SpeakerEncoderConfig,
     mel_extractor: MelSpectrogram,
 
@@ -184,7 +196,9 @@ impl SpeakerEncoder {
     /// Extract speaker embedding from audio
     pub fn encode(&self, audio: &AudioBuffer) -> Result<Tensor> {
         // Compute mel spectrogram
-        let mel = self.mel_extractor.compute_tensor(&audio.samples, &self.device)?;
+        let mel = self
+            .mel_extractor
+            .compute_tensor(&audio.samples, &self.device)?;
         let mel = mel.unsqueeze(0)?; // Add batch dimension
 
         self.forward(&mel)
@@ -212,6 +226,7 @@ impl SpeakerEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::DType;
     use candle_nn::VarMap;
 
     fn create_mock_vb(device: &Device) -> VarBuilder<'static> {

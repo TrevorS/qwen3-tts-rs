@@ -70,17 +70,12 @@ impl Qwen3TTS {
     }
 
     /// Synthesize speech from text
-    pub fn synthesize(
-        &self,
-        text: &str,
-        options: Option<SynthesisOptions>,
-    ) -> Result<AudioBuffer> {
+    pub fn synthesize(&self, text: &str, options: Option<SynthesisOptions>) -> Result<AudioBuffer> {
         let options = options.unwrap_or_default();
 
         // Tokenize text
         let input_ids = self.text_tokenizer.encode(text)?;
-        let input_tensor = Tensor::new(input_ids.as_slice(), &self.device)?
-            .unsqueeze(0)?; // Add batch dimension
+        let input_tensor = Tensor::new(input_ids.as_slice(), &self.device)?.unsqueeze(0)?; // Add batch dimension
 
         // Generate codec tokens
         let codec_tokens = self.model.generate(
@@ -92,13 +87,14 @@ impl Qwen3TTS {
                 top_k: options.top_k,
                 top_p: options.top_p,
                 repetition_penalty: options.repetition_penalty,
+                eos_token_id: options.eos_token_id,
             },
         )?;
 
         // Decode codec tokens to audio waveform
         let waveform = self.audio_codec.decode(&codec_tokens)?;
 
-        Ok(AudioBuffer::from_tensor(waveform, 24000)?)
+        AudioBuffer::from_tensor(waveform, 24000)
     }
 
     /// Get the device this model is running on
@@ -106,6 +102,9 @@ impl Qwen3TTS {
         &self.device
     }
 }
+
+/// Audio end-of-sequence token ID for Qwen3-TTS
+pub const AUDIO_EOS_TOKEN_ID: u32 = 151670;
 
 /// Options for speech synthesis
 #[derive(Debug, Clone)]
@@ -124,6 +123,8 @@ pub struct SynthesisOptions {
     pub speaker_embedding: Option<Tensor>,
     /// Language code (e.g., "en", "zh")
     pub language: Option<String>,
+    /// End-of-sequence token ID (defaults to audio_end token 151670)
+    pub eos_token_id: Option<u32>,
 }
 
 impl Default for SynthesisOptions {
@@ -136,6 +137,7 @@ impl Default for SynthesisOptions {
             repetition_penalty: 1.0,
             speaker_embedding: None,
             language: None,
+            eos_token_id: Some(AUDIO_EOS_TOKEN_ID),
         }
     }
 }
@@ -178,6 +180,7 @@ mod tests {
         assert!((options.repetition_penalty - 1.0).abs() < 1e-6);
         assert!(options.speaker_embedding.is_none());
         assert!(options.language.is_none());
+        assert_eq!(options.eos_token_id, Some(AUDIO_EOS_TOKEN_ID));
     }
 
     #[test]
@@ -190,10 +193,12 @@ mod tests {
             repetition_penalty: 1.2,
             speaker_embedding: None,
             language: Some("en".to_string()),
+            eos_token_id: Some(AUDIO_EOS_TOKEN_ID),
         };
         assert_eq!(options.max_length, 512);
         assert!((options.temperature - 0.5).abs() < 1e-6);
         assert_eq!(options.language, Some("en".to_string()));
+        assert_eq!(options.eos_token_id, Some(151670));
     }
 
     #[test]
@@ -217,7 +222,11 @@ mod tests {
         // Should always succeed on CPU
         let device = auto_device().unwrap();
         // Just verify it returns a valid device
-        assert!(matches!(device, Device::Cpu) || matches!(device, Device::Cuda(_)) || matches!(device, Device::Metal(_)));
+        assert!(
+            matches!(device, Device::Cpu)
+                || matches!(device, Device::Cuda(_))
+                || matches!(device, Device::Metal(_))
+        );
     }
 
     #[test]
