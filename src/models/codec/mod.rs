@@ -7,11 +7,21 @@
 //! - 12Hz (Mimi-based): Higher quality, newer architecture
 //! - 25Hz (BigVGAN-based): Faster, more established
 
+pub mod causal_conv;
+pub mod causal_trans_conv;
+pub mod convnext_block;
 pub mod decoder;
+pub mod decoder_block;
 mod quantizer;
+pub mod snake_beta;
 
+pub use causal_conv::CausalConv1d;
+pub use causal_trans_conv::CausalTransConv1d;
+pub use convnext_block::ConvNeXtBlock;
 pub use decoder::{CodecDecoder, DecoderConfig};
+pub use decoder_block::{DecoderBlock, ResidualUnit};
 pub use quantizer::{ResidualVectorQuantizer, VectorQuantizer};
+pub use snake_beta::SnakeBeta;
 
 use anyhow::Result;
 use candle_core::{Device, Tensor};

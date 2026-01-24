@@ -1391,7 +1391,6 @@ fn test_speech_tokenizer_decoder() -> Result<()> {
     let num_quantizers = 16usize;
     let seq_len = 2usize;
     let codebook_dim = 256usize;
-    let hidden_size = 512usize;
     let num_layers = 8usize;
     let num_heads = 16usize;
     let head_dim = 64usize;
@@ -1460,8 +1459,9 @@ fn test_speech_tokenizer_decoder() -> Result<()> {
 
     println!("  Quantizer decode PASS!");
 
-    // ===== 2. Pre-conv =====
-    println!("  Testing pre-conv...");
+    // ===== 2. Pre-conv (Causal Conv1d) =====
+    println!("  Testing pre-conv (causal conv)...");
+    use qwen3_tts::models::codec::CausalConv1d;
 
     let pre_conv_w = st_weights.get("decoder.pre_conv.conv.weight").unwrap();
     let pre_conv_b = st_weights.get("decoder.pre_conv.conv.bias").unwrap();
@@ -1469,21 +1469,24 @@ fn test_speech_tokenizer_decoder() -> Result<()> {
     // Transpose to [batch, channels, seq]
     let x = quantized.transpose(1, 2)?;
 
-    // Causal padding (left only)
-    let kernel_size = pre_conv_w.dim(2)?;
-    let padding = kernel_size - 1;
+    // Create CausalConv1d and run forward
+    let causal_conv = CausalConv1d::from_weights(pre_conv_w.clone(), Some(pre_conv_b.clone()), 1)?;
+    let pre_conv_out_channels = causal_conv.forward(&x)?;
 
-    // Manual causal padding: pad left with zeros
-    let pad_zeros = Tensor::zeros((batch_size, 512, padding), DType::F32, &device)?;
-    let x_padded = Tensor::cat(&[&pad_zeros, &x], 2)?;
-
-    // Apply conv1d manually (candle doesn't have padding=left)
-    // For now, just verify shape and move on
-    // The actual conv1d would need custom implementation
-
+    // Load Python reference (in [batch, seq, channels] format)
     let python_pre_conv = load_reference("decoder_pre_conv.bin", &[1, 2, 1024], &device)?;
-    println!("  Pre-conv reference shape: {:?}", python_pre_conv.dims());
-    println!("  (Skipping pre-conv validation - needs causal conv implementation)");
+    // Transpose for comparison
+    let rust_pre_conv = pre_conv_out_channels.transpose(1, 2)?;
+
+    compare_tensors("pre_conv", &rust_pre_conv, &python_pre_conv)?;
+    let diff = (&rust_pre_conv - &python_pre_conv)?.abs()?;
+    let max_diff: f32 = diff.flatten_all()?.max(0)?.to_scalar()?;
+    assert!(
+        max_diff < 1e-5,
+        "Pre-conv output should match within 1e-5, got {}",
+        max_diff
+    );
+    println!("  Pre-conv PASS!");
 
     // ===== 3. Pre-transformer =====
     println!("  Testing pre-transformer layers...");
@@ -1630,6 +1633,557 @@ fn test_speech_tokenizer_decoder() -> Result<()> {
 
     println!("  Pre-transformer PASS!");
     println!("  SPEECH TOKENIZER DECODER PASS!");
+
+    Ok(())
+}
+
+#[test]
+fn test_causal_conv1d() -> Result<()> {
+    // Test the CausalConv1d implementation against Python reference
+    use qwen3_tts::models::codec::CausalConv1d;
+
+    // Check if decoder reference exists
+    if !Path::new(REFERENCE_DIR)
+        .join("causal_conv_input.bin")
+        .exists()
+    {
+        eprintln!(
+            "Causal conv reference values not found. Run: python3 tools/export_decoder_reference.py"
+        );
+        return Ok(());
+    }
+
+    let device = Device::Cpu;
+
+    println!("\n=== Causal Conv1d Validation ===");
+
+    // Load speech tokenizer weights
+    let st_path = Path::new("test_data/speech_tokenizer/model.safetensors");
+    let st_weights: HashMap<String, Tensor> = candle_core::safetensors::load(st_path, &device)?;
+    let st_weights: HashMap<String, Tensor> = st_weights
+        .into_iter()
+        .map(|(name, tensor)| {
+            let converted = if tensor.dtype() == DType::BF16 {
+                tensor.to_dtype(DType::F32).unwrap()
+            } else {
+                tensor
+            };
+            (name, converted)
+        })
+        .collect();
+
+    // Load pre-conv weights
+    let pre_conv_w = st_weights.get("decoder.pre_conv.conv.weight").unwrap();
+    let pre_conv_b = st_weights.get("decoder.pre_conv.conv.bias").unwrap();
+
+    println!("  Pre-conv weight shape: {:?}", pre_conv_w.dims());
+
+    // Create CausalConv1d from weights
+    let dilation = 1;
+    let causal_conv =
+        CausalConv1d::from_weights(pre_conv_w.clone(), Some(pre_conv_b.clone()), dilation)?;
+
+    // Load input from Python: [1, 512, 2]
+    let input = load_reference("causal_conv_input.bin", &[1, 512, 2], &device)?;
+    println!("  Input shape: {:?}", input.dims());
+
+    // Run causal conv
+    let rust_output = causal_conv.forward(&input)?;
+    println!("  Rust output shape: {:?}", rust_output.dims());
+
+    // Load Python reference output: [1, 1024, 2]
+    let python_output = load_reference("causal_conv_output.bin", &[1, 1024, 2], &device)?;
+
+    compare_tensors("causal_conv_output", &rust_output, &python_output)?;
+
+    let diff = (&rust_output - &python_output)?.abs()?;
+    let max_diff: f32 = diff.flatten_all()?.max(0)?.to_scalar()?;
+    assert!(
+        max_diff < 1e-5,
+        "Causal conv output should match within 1e-5, got {}",
+        max_diff
+    );
+
+    println!("  CAUSAL CONV1D PASS!");
+
+    Ok(())
+}
+
+#[test]
+fn test_snake_beta() -> Result<()> {
+    // Test the SnakeBeta activation against Python reference
+    use qwen3_tts::models::codec::SnakeBeta;
+
+    // Check if reference exists
+    if !Path::new(REFERENCE_DIR)
+        .join("snake_beta_input.bin")
+        .exists()
+    {
+        eprintln!(
+            "SnakeBeta reference values not found. Run: python3 tools/export_decoder_reference.py"
+        );
+        return Ok(());
+    }
+
+    let device = Device::Cpu;
+
+    println!("\n=== SnakeBeta Validation ===");
+
+    // Load reference values
+    let input = load_reference("snake_beta_input.bin", &[1, 1536, 8], &device)?;
+    let alpha = load_reference("snake_beta_alpha.bin", &[1536], &device)?;
+    let beta = load_reference("snake_beta_beta.bin", &[1536], &device)?;
+    let python_output = load_reference("snake_beta_output.bin", &[1, 1536, 8], &device)?;
+
+    println!("  Input shape: {:?}", input.dims());
+
+    // Create SnakeBeta from weights
+    let snake = SnakeBeta::from_weights(alpha, beta)?;
+
+    // Run forward
+    let rust_output = snake.forward(&input)?;
+
+    println!("  Rust output shape: {:?}", rust_output.dims());
+
+    compare_tensors("snake_beta_output", &rust_output, &python_output)?;
+
+    let diff = (&rust_output - &python_output)?.abs()?;
+    let max_diff: f32 = diff.flatten_all()?.max(0)?.to_scalar()?;
+    assert!(
+        max_diff < 1e-5,
+        "SnakeBeta output should match within 1e-5, got {}",
+        max_diff
+    );
+
+    println!("  SNAKE BETA PASS!");
+
+    Ok(())
+}
+
+#[test]
+fn test_causal_trans_conv1d() -> Result<()> {
+    // Test the CausalTransConv1d implementation against Python reference
+    use qwen3_tts::models::codec::CausalTransConv1d;
+
+    // Check if reference exists
+    if !Path::new(REFERENCE_DIR)
+        .join("decoder_output_proj.bin")
+        .exists()
+    {
+        eprintln!(
+            "Decoder reference values not found. Run: python3 tools/export_decoder_reference.py"
+        );
+        return Ok(());
+    }
+
+    let device = Device::Cpu;
+
+    println!("\n=== CausalTransConv1d Validation ===");
+
+    // Load speech tokenizer weights
+    let st_path = Path::new("test_data/speech_tokenizer/model.safetensors");
+    let st_weights: HashMap<String, Tensor> = candle_core::safetensors::load(st_path, &device)?;
+    let st_weights: HashMap<String, Tensor> = st_weights
+        .into_iter()
+        .map(|(name, tensor)| {
+            let converted = if tensor.dtype() == DType::BF16 {
+                tensor.to_dtype(DType::F32).unwrap()
+            } else {
+                tensor
+            };
+            (name, converted)
+        })
+        .collect();
+
+    // Load the input to upsample stage 0 (output_proj transposed)
+    let output_proj = load_reference("decoder_output_proj.bin", &[1, 2, 1024], &device)?;
+    let input = output_proj.transpose(1, 2)?; // [1, 1024, 2]
+
+    println!("  Input shape: {:?}", input.dims());
+
+    // Load upsample.0.0 weights (CausalTransConvNet with kernel=2, stride=2)
+    let conv_w = st_weights.get("decoder.upsample.0.0.conv.weight").unwrap();
+    let conv_b = st_weights.get("decoder.upsample.0.0.conv.bias").unwrap();
+
+    println!("  Conv weight shape: {:?}", conv_w.dims());
+
+    // Create CausalTransConv1d
+    // kernel_size = 2, stride = 2 (for upsampling_ratio = 2)
+    let stride = 2;
+    let trans_conv = CausalTransConv1d::from_weights(conv_w.clone(), Some(conv_b.clone()), stride)?;
+
+    // Run forward
+    let rust_output = trans_conv.forward(&input)?;
+
+    println!("  Rust output shape: {:?}", rust_output.dims());
+
+    // Load Python reference: [1, 1024, 4]
+    let python_output = load_reference("decoder_upsample_0_0.bin", &[1, 1024, 4], &device)?;
+
+    compare_tensors("trans_conv_output", &rust_output, &python_output)?;
+
+    let diff = (&rust_output - &python_output)?.abs()?;
+    let max_diff: f32 = diff.flatten_all()?.max(0)?.to_scalar()?;
+    assert!(
+        max_diff < 1e-5,
+        "CausalTransConv1d output should match within 1e-5, got {}",
+        max_diff
+    );
+
+    println!("  CAUSAL TRANS CONV1D PASS!");
+
+    Ok(())
+}
+
+#[test]
+fn test_convnext_block() -> Result<()> {
+    // Test the ConvNeXtBlock implementation against Python reference
+    use qwen3_tts::models::codec::ConvNeXtBlock;
+
+    // Check if reference exists
+    if !Path::new(REFERENCE_DIR)
+        .join("decoder_upsample_0_0.bin")
+        .exists()
+    {
+        eprintln!(
+            "Decoder reference values not found. Run: python3 tools/export_decoder_reference.py"
+        );
+        return Ok(());
+    }
+
+    let device = Device::Cpu;
+
+    println!("\n=== ConvNeXtBlock Validation ===");
+
+    // Load speech tokenizer weights
+    let st_path = Path::new("test_data/speech_tokenizer/model.safetensors");
+    let st_weights: HashMap<String, Tensor> = candle_core::safetensors::load(st_path, &device)?;
+    let st_weights: HashMap<String, Tensor> = st_weights
+        .into_iter()
+        .map(|(name, tensor)| {
+            let converted = if tensor.dtype() == DType::BF16 {
+                tensor.to_dtype(DType::F32).unwrap()
+            } else {
+                tensor
+            };
+            (name, converted)
+        })
+        .collect();
+
+    // Input is the output from upsample.0.0 (CausalTransConv)
+    let input = load_reference("decoder_upsample_0_0.bin", &[1, 1024, 4], &device)?;
+
+    println!("  Input shape: {:?}", input.dims());
+
+    // Load ConvNeXtBlock weights for stage 0
+    let prefix = "decoder.upsample.0.1";
+    let dwconv_w = st_weights
+        .get(&format!("{}.dwconv.conv.weight", prefix))
+        .unwrap();
+    let dwconv_b = st_weights
+        .get(&format!("{}.dwconv.conv.bias", prefix))
+        .unwrap();
+    let norm_w = st_weights.get(&format!("{}.norm.weight", prefix)).unwrap();
+    let norm_b = st_weights.get(&format!("{}.norm.bias", prefix)).unwrap();
+    let pwconv1_w = st_weights
+        .get(&format!("{}.pwconv1.weight", prefix))
+        .unwrap();
+    let pwconv1_b = st_weights.get(&format!("{}.pwconv1.bias", prefix)).unwrap();
+    let pwconv2_w = st_weights
+        .get(&format!("{}.pwconv2.weight", prefix))
+        .unwrap();
+    let pwconv2_b = st_weights.get(&format!("{}.pwconv2.bias", prefix)).unwrap();
+    let gamma = st_weights.get(&format!("{}.gamma", prefix)).unwrap();
+
+    println!("  dwconv weight shape: {:?}", dwconv_w.dims());
+
+    // Create ConvNeXtBlock
+    let block = ConvNeXtBlock::from_weights(
+        dwconv_w.clone(),
+        Some(dwconv_b.clone()),
+        norm_w.clone(),
+        norm_b.clone(),
+        pwconv1_w.clone(),
+        pwconv1_b.clone(),
+        pwconv2_w.clone(),
+        pwconv2_b.clone(),
+        gamma.clone(),
+    )?;
+
+    // Run forward
+    let rust_output = block.forward(&input)?;
+
+    println!("  Rust output shape: {:?}", rust_output.dims());
+
+    // Load Python reference
+    let python_output = load_reference("decoder_upsample_0_1.bin", &[1, 1024, 4], &device)?;
+
+    compare_tensors("convnext_output", &rust_output, &python_output)?;
+
+    let diff = (&rust_output - &python_output)?.abs()?;
+    let max_diff: f32 = diff.flatten_all()?.max(0)?.to_scalar()?;
+    assert!(
+        max_diff < 1e-4,
+        "ConvNeXtBlock output should match within 1e-4, got {}",
+        max_diff
+    );
+
+    println!("  CONVNEXT BLOCK PASS!");
+
+    Ok(())
+}
+
+#[test]
+fn test_residual_unit() -> Result<()> {
+    // Test the ResidualUnit implementation against Python reference
+    use qwen3_tts::models::codec::ResidualUnit;
+
+    // Check if reference exists
+    if !Path::new(REFERENCE_DIR)
+        .join("decoder_decoder_0.bin")
+        .exists()
+    {
+        eprintln!(
+            "Decoder reference values not found. Run: python3 tools/export_decoder_reference.py"
+        );
+        return Ok(());
+    }
+
+    let device = Device::Cpu;
+
+    println!("\n=== ResidualUnit Validation ===");
+
+    // Load speech tokenizer weights
+    let st_path = Path::new("test_data/speech_tokenizer/model.safetensors");
+    let st_weights: HashMap<String, Tensor> = candle_core::safetensors::load(st_path, &device)?;
+    let st_weights: HashMap<String, Tensor> = st_weights
+        .into_iter()
+        .map(|(name, tensor)| {
+            let converted = if tensor.dtype() == DType::BF16 {
+                tensor.to_dtype(DType::F32).unwrap()
+            } else {
+                tensor
+            };
+            (name, converted)
+        })
+        .collect();
+
+    // Use a simpler test: take decoder.0 output and run through just one residual unit
+    // We'll construct a residual unit from decoder.decoder.1.block.2 (first res unit, dilation=1)
+    let prefix = "decoder.decoder.1.block.2";
+    let dilation = 1;
+
+    // Load residual unit weights
+    let act1_alpha = st_weights.get(&format!("{}.act1.alpha", prefix)).unwrap();
+    let act1_beta = st_weights.get(&format!("{}.act1.beta", prefix)).unwrap();
+    let conv1_w = st_weights
+        .get(&format!("{}.conv1.conv.weight", prefix))
+        .unwrap();
+    let conv1_b = st_weights
+        .get(&format!("{}.conv1.conv.bias", prefix))
+        .unwrap();
+    let act2_alpha = st_weights.get(&format!("{}.act2.alpha", prefix)).unwrap();
+    let act2_beta = st_weights.get(&format!("{}.act2.beta", prefix)).unwrap();
+    let conv2_w = st_weights
+        .get(&format!("{}.conv2.conv.weight", prefix))
+        .unwrap();
+    let conv2_b = st_weights
+        .get(&format!("{}.conv2.conv.bias", prefix))
+        .unwrap();
+
+    println!("  Conv1 weight shape: {:?}", conv1_w.dims());
+    println!("  Conv2 weight shape: {:?}", conv2_w.dims());
+
+    // Create residual unit
+    let unit = ResidualUnit::from_weights(
+        act1_alpha.clone(),
+        act1_beta.clone(),
+        conv1_w.clone(),
+        conv1_b.clone(),
+        act2_alpha.clone(),
+        act2_beta.clone(),
+        conv2_w.clone(),
+        conv2_b.clone(),
+        dilation,
+    )?;
+
+    // Create a test input of same size as res unit output
+    let input = Tensor::randn(0.0f32, 1.0, (1, 768, 64), &device)?;
+    let output = unit.forward(&input)?;
+
+    // Verify shapes match (residual connection)
+    assert_eq!(
+        output.dims(),
+        input.dims(),
+        "ResidualUnit should preserve input shape"
+    );
+
+    println!("  Input shape: {:?}", input.dims());
+    println!("  Output shape: {:?}", output.dims());
+    println!("  RESIDUAL UNIT PASS!");
+
+    Ok(())
+}
+
+#[test]
+fn test_decoder_block() -> Result<()> {
+    // Test the full DecoderBlock implementation against Python reference
+    use qwen3_tts::models::codec::DecoderBlock;
+
+    // Check if reference exists
+    if !Path::new(REFERENCE_DIR)
+        .join("decoder_decoder_1.bin")
+        .exists()
+    {
+        eprintln!(
+            "Decoder reference values not found. Run: python3 tools/export_decoder_reference.py"
+        );
+        return Ok(());
+    }
+
+    let device = Device::Cpu;
+
+    println!("\n=== DecoderBlock Validation ===");
+
+    // Load speech tokenizer weights
+    let st_path = Path::new("test_data/speech_tokenizer/model.safetensors");
+    let st_weights: HashMap<String, Tensor> = candle_core::safetensors::load(st_path, &device)?;
+    let st_weights: HashMap<String, Tensor> = st_weights
+        .into_iter()
+        .map(|(name, tensor)| {
+            let converted = if tensor.dtype() == DType::BF16 {
+                tensor.to_dtype(DType::F32).unwrap()
+            } else {
+                tensor
+            };
+            (name, converted)
+        })
+        .collect();
+
+    // Input is decoder.0 output: [1, 1536, 8]
+    let input = load_reference("decoder_decoder_0.bin", &[1, 1536, 8], &device)?;
+
+    println!("  Input shape: {:?}", input.dims());
+
+    // Load decoder block 1 weights (rate=8)
+    let prefix = "decoder.decoder.1.block";
+    let upsample_rate = 8;
+
+    // block.0: SnakeBeta
+    let snake_alpha = st_weights.get(&format!("{}.0.alpha", prefix)).unwrap();
+    let snake_beta_param = st_weights.get(&format!("{}.0.beta", prefix)).unwrap();
+
+    // block.1: CausalTransConv
+    let upsample_w = st_weights
+        .get(&format!("{}.1.conv.weight", prefix))
+        .unwrap();
+    let upsample_b = st_weights.get(&format!("{}.1.conv.bias", prefix)).unwrap();
+
+    println!("  Upsample weight shape: {:?}", upsample_w.dims());
+
+    // Helper to load residual unit weights
+    let load_res_weights = |block_idx: usize| -> (
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+    ) {
+        (
+            st_weights
+                .get(&format!("{}.{}.act1.alpha", prefix, block_idx))
+                .unwrap()
+                .clone(),
+            st_weights
+                .get(&format!("{}.{}.act1.beta", prefix, block_idx))
+                .unwrap()
+                .clone(),
+            st_weights
+                .get(&format!("{}.{}.conv1.conv.weight", prefix, block_idx))
+                .unwrap()
+                .clone(),
+            st_weights
+                .get(&format!("{}.{}.conv1.conv.bias", prefix, block_idx))
+                .unwrap()
+                .clone(),
+            st_weights
+                .get(&format!("{}.{}.act2.alpha", prefix, block_idx))
+                .unwrap()
+                .clone(),
+            st_weights
+                .get(&format!("{}.{}.act2.beta", prefix, block_idx))
+                .unwrap()
+                .clone(),
+            st_weights
+                .get(&format!("{}.{}.conv2.conv.weight", prefix, block_idx))
+                .unwrap()
+                .clone(),
+            st_weights
+                .get(&format!("{}.{}.conv2.conv.bias", prefix, block_idx))
+                .unwrap()
+                .clone(),
+        )
+    };
+
+    let (r1_a1a, r1_a1b, r1_c1w, r1_c1b, r1_a2a, r1_a2b, r1_c2w, r1_c2b) = load_res_weights(2);
+    let (r2_a1a, r2_a1b, r2_c1w, r2_c1b, r2_a2a, r2_a2b, r2_c2w, r2_c2b) = load_res_weights(3);
+    let (r3_a1a, r3_a1b, r3_c1w, r3_c1b, r3_a2a, r3_a2b, r3_c2w, r3_c2b) = load_res_weights(4);
+
+    // Create decoder block
+    let block = DecoderBlock::from_weights(
+        snake_alpha.clone(),
+        snake_beta_param.clone(),
+        upsample_w.clone(),
+        upsample_b.clone(),
+        r1_a1a,
+        r1_a1b,
+        r1_c1w,
+        r1_c1b,
+        r1_a2a,
+        r1_a2b,
+        r1_c2w,
+        r1_c2b,
+        r2_a1a,
+        r2_a1b,
+        r2_c1w,
+        r2_c1b,
+        r2_a2a,
+        r2_a2b,
+        r2_c2w,
+        r2_c2b,
+        r3_a1a,
+        r3_a1b,
+        r3_c1w,
+        r3_c1b,
+        r3_a2a,
+        r3_a2b,
+        r3_c2w,
+        r3_c2b,
+        upsample_rate,
+    )?;
+
+    // Run forward
+    let rust_output = block.forward(&input)?;
+
+    println!("  Rust output shape: {:?}", rust_output.dims());
+
+    // Load Python reference: [1, 768, 64]
+    let python_output = load_reference("decoder_decoder_1.bin", &[1, 768, 64], &device)?;
+
+    compare_tensors("decoder_block_output", &rust_output, &python_output)?;
+
+    let diff = (&rust_output - &python_output)?.abs()?;
+    let max_diff: f32 = diff.flatten_all()?.max(0)?.to_scalar()?;
+    assert!(
+        max_diff < 1e-3,
+        "DecoderBlock output should match within 1e-3, got {}",
+        max_diff
+    );
+
+    println!("  DECODER BLOCK PASS!");
 
     Ok(())
 }

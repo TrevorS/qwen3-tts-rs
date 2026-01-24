@@ -236,7 +236,7 @@ fn main() -> Result<()> {
             return Ok(x.clone());
         }
         // x shape: [num_kv_heads, seq_len, head_dim]
-        let (n_kv, seq, hd) = x.dims3()?;
+        let (n_kv, _seq, _hd) = x.dims3()?;
         // Repeat by concatenating
         let repeated: Vec<Tensor> = (0..n_kv)
             .flat_map(|i| {

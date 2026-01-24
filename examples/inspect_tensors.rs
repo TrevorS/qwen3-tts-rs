@@ -15,7 +15,7 @@ fn main() -> anyhow::Result<()> {
             .iter()
             .filter(|(k, _)| k.contains("code_predictor"))
             .collect();
-        cp_tensors.sort_by_key(|(k, _)| k.clone());
+        cp_tensors.sort_by_key(|(k, _)| (*k).clone());
 
         for (name, t) in &cp_tensors {
             println!("  {}: {:?}", name, t.dims());

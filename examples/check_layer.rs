@@ -12,7 +12,7 @@ fn main() -> anyhow::Result<()> {
         .iter()
         .filter(|(n, _)| n.starts_with("talker.model.layers.0."))
         .collect();
-    layer0.sort_by_key(|(n, _)| n.clone());
+    layer0.sort_by_key(|(n, _)| (*n).clone());
 
     for (name, tensor) in layer0 {
         println!("  {}: {:?}", name, tensor.dims());

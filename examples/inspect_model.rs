@@ -70,7 +70,7 @@ fn main() -> anyhow::Result<()> {
                 || name.contains("lm_head")
         })
         .collect();
-    embed_tensors.sort_by_key(|(name, _)| name.clone());
+    embed_tensors.sort_by_key(|(name, _)| (*name).clone());
 
     for (name, tensor) in embed_tensors {
         println!("  {}: {:?}", name, tensor.dims());
