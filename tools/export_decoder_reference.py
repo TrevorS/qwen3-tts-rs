@@ -41,16 +41,22 @@ def export_decoder_reference():
 
     # Get codebook embeddings
     # Split RVQ: rvq_first (1 codebook) + rvq_rest (15 codebooks)
+    # IMPORTANT: embeddings = embedding_sum / cluster_usage.clamp(min=epsilon) (per official implementation)
     codebook_dim = dec_config["codebook_dim"]  # 512
+    epsilon = 1e-7
 
     # First quantizer (semantic)
-    first_codebook = weights["decoder.quantizer.rvq_first.vq.layers.0._codebook.embedding_sum"]
+    first_embedding_sum = weights["decoder.quantizer.rvq_first.vq.layers.0._codebook.embedding_sum"]
+    first_cluster_usage = weights["decoder.quantizer.rvq_first.vq.layers.0._codebook.cluster_usage"]
+    first_codebook = first_embedding_sum / first_cluster_usage.clamp(min=epsilon).unsqueeze(-1)
     print(f"First codebook shape: {first_codebook.shape}")
 
     # Rest quantizers (acoustic)
     rest_codebooks = []
     for i in range(15):
-        cb = weights[f"decoder.quantizer.rvq_rest.vq.layers.{i}._codebook.embedding_sum"]
+        embedding_sum = weights[f"decoder.quantizer.rvq_rest.vq.layers.{i}._codebook.embedding_sum"]
+        cluster_usage = weights[f"decoder.quantizer.rvq_rest.vq.layers.{i}._codebook.cluster_usage"]
+        cb = embedding_sum / cluster_usage.clamp(min=epsilon).unsqueeze(-1)
         rest_codebooks.append(cb)
         if i == 0:
             print(f"Rest codebook shape: {cb.shape}")
@@ -221,11 +227,18 @@ def export_decoder_reference():
         if layer_idx % 2 == 0 or layer_idx == num_layers - 1:
             print(f"  Layer {layer_idx}: mean={hidden.mean().item():.6f}")
 
-    print(f"Pre-transformer output: {hidden.shape}")
+    print(f"Pre-transformer output (before final norm): {hidden.shape}")
     save_tensor(output_dir / "decoder_pre_transformer.bin", hidden)
 
-    # ===== 4. Output projection =====
-    print("\n=== Output Projection ===")
+    # ===== 4. Final norm and output projection =====
+    print("\n=== Final Norm and Output Projection ===")
+
+    # Apply final RMS norm before output projection
+    final_norm_w = weights["decoder.pre_transformer.norm.weight"]
+    hidden = rms_norm(hidden, final_norm_w, eps)
+    print(f"After final norm: mean={hidden.mean().item():.6f}")
+
+    # Output projection
     output_proj_w = weights["decoder.pre_transformer.output_proj.weight"]
     output_proj_b = weights["decoder.pre_transformer.output_proj.bias"]
     hidden = torch.nn.functional.linear(hidden, output_proj_w, output_proj_b)
@@ -365,14 +378,11 @@ def export_decoder_reference():
         stride = rate
 
         hidden = torch.nn.functional.conv_transpose1d(hidden, conv_w, conv_b, stride=stride)
-        # Trim for causality
-        pad = kernel_size - stride
-        left_pad = (pad + 1) // 2
-        right_pad = pad - left_pad
-        if right_pad > 0:
-            hidden = hidden[..., left_pad:-right_pad]
-        else:
-            hidden = hidden[..., left_pad:]
+        # Trim from both sides to match official Qwen3-TTS model
+        # pad = kernel_size - stride, trim ceil(pad) from each side
+        trim = kernel_size - stride
+        if trim > 0:
+            hidden = hidden[..., trim:-trim]
         print(f"    After TransConv (rate={rate}): {hidden.shape}")
 
         # block.2-4: 3 ResidualUnits (dilations 1, 3, 9)

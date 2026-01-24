@@ -295,12 +295,17 @@ def export_e2e_reference():
     # ===== 5. Decoder =====
     print("\n=== Step 5: Decoder ===")
 
-    # 5.1 Quantizer decode
-    first_codebook = decoder_weights["decoder.quantizer.rvq_first.vq.layers.0._codebook.embedding_sum"]
-    rest_codebooks = [
-        decoder_weights[f"decoder.quantizer.rvq_rest.vq.layers.{i}._codebook.embedding_sum"]
-        for i in range(15)
-    ]
+    # 5.1 Quantizer decode - normalize by cluster_usage.clamp(min=epsilon) as per official implementation
+    epsilon = 1e-7
+    first_embedding_sum = decoder_weights["decoder.quantizer.rvq_first.vq.layers.0._codebook.embedding_sum"]
+    first_cluster_usage = decoder_weights["decoder.quantizer.rvq_first.vq.layers.0._codebook.cluster_usage"]
+    first_codebook = first_embedding_sum / first_cluster_usage.clamp(min=epsilon).unsqueeze(-1)
+
+    rest_codebooks = []
+    for i in range(15):
+        embedding_sum = decoder_weights[f"decoder.quantizer.rvq_rest.vq.layers.{i}._codebook.embedding_sum"]
+        cluster_usage = decoder_weights[f"decoder.quantizer.rvq_rest.vq.layers.{i}._codebook.cluster_usage"]
+        rest_codebooks.append(embedding_sum / cluster_usage.clamp(min=epsilon).unsqueeze(-1))
 
     embeddings = []
     embeddings.append(first_codebook[codes[:, 0, :]])
@@ -397,6 +402,10 @@ def export_e2e_reference():
         mlp_out = mlp_out * mlp_scale
         x = x + mlp_out
 
+    # Final norm before output projection
+    final_norm_w = decoder_weights["decoder.pre_transformer.norm.weight"]
+    x = rms_norm(x, final_norm_w, dec_eps)
+
     # Output projection
     output_proj_w = decoder_weights["decoder.pre_transformer.output_proj.weight"]
     output_proj_b = decoder_weights["decoder.pre_transformer.output_proj.bias"]
@@ -477,13 +486,11 @@ def export_e2e_reference():
         stride = rate
 
         x = torch.nn.functional.conv_transpose1d(x, conv_w, conv_b, stride=stride)
-        pad = kernel_size - stride
-        left_pad = (pad + 1) // 2
-        right_pad = pad - left_pad
-        if right_pad > 0:
-            x = x[..., left_pad:-right_pad]
-        else:
-            x = x[..., left_pad:]
+        # Trim from both sides to match official Qwen3-TTS model
+        # pad = kernel_size - stride, trim ceil(pad) from each side
+        trim = kernel_size - stride
+        if trim > 0:
+            x = x[..., trim:-trim]
 
         # ResidualUnits
         for unit_idx, dilation in enumerate([1, 3, 9], start=2):
