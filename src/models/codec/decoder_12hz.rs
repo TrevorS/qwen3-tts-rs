@@ -123,7 +123,6 @@ pub struct Decoder12Hz {
     /// Output projection for first quantizer [512, 256, 1]
     first_output_proj: Tensor,
     /// Output projection for rest quantizers [512, 256, 1]
-    #[allow(dead_code)]
     rest_output_proj: Tensor,
     /// Pre-conv: [codebook_dim, latent_dim, 3]
     pre_conv: CausalConv1d,
@@ -132,6 +131,8 @@ pub struct Decoder12Hz {
     input_proj_bias: Tensor,
     /// Transformer layers weights
     transformer_weights: TransformerWeights,
+    /// Final norm for transformer
+    final_norm_weight: Tensor,
     /// Output projection for transformer
     output_proj_weight: Tensor,
     output_proj_bias: Tensor,
@@ -176,21 +177,42 @@ impl Decoder12Hz {
             .map(|t| t.device().clone())
             .unwrap_or(Device::Cpu);
 
-        // Load codebooks
-        let first_codebook = weights
+        // Load codebooks - normalize by cluster_usage as per official implementation
+        // embedding = embedding_sum / cluster_usage
+        let first_embedding_sum = weights
             .get("decoder.quantizer.rvq_first.vq.layers.0._codebook.embedding_sum")
-            .ok_or_else(|| anyhow::anyhow!("Missing first codebook"))?
+            .ok_or_else(|| anyhow::anyhow!("Missing first codebook embedding_sum"))?
             .clone();
+        let first_cluster_usage = weights
+            .get("decoder.quantizer.rvq_first.vq.layers.0._codebook.cluster_usage")
+            .ok_or_else(|| anyhow::anyhow!("Missing first codebook cluster_usage"))?
+            .clone();
+        // Normalize: embedding = embedding_sum / cluster_usage.clamp(min=epsilon).unsqueeze(-1)
+        // Per official implementation, clamp cluster_usage to avoid divide-by-zero
+        let epsilon = 1e-7f32;
+        let first_cluster_usage_clamped = first_cluster_usage.clamp(epsilon, f32::MAX)?;
+        let first_codebook = first_embedding_sum
+            .broadcast_div(&first_cluster_usage_clamped.unsqueeze(1)?)?;
 
         let mut rest_codebooks = Vec::with_capacity(15);
         for i in 0..15 {
-            let cb = weights
+            let embedding_sum = weights
                 .get(&format!(
                     "decoder.quantizer.rvq_rest.vq.layers.{}._codebook.embedding_sum",
                     i
                 ))
-                .ok_or_else(|| anyhow::anyhow!("Missing rest codebook {}", i))?
+                .ok_or_else(|| anyhow::anyhow!("Missing rest codebook {} embedding_sum", i))?
                 .clone();
+            let cluster_usage = weights
+                .get(&format!(
+                    "decoder.quantizer.rvq_rest.vq.layers.{}._codebook.cluster_usage",
+                    i
+                ))
+                .ok_or_else(|| anyhow::anyhow!("Missing rest codebook {} cluster_usage", i))?
+                .clone();
+            // Normalize: embedding = embedding_sum / cluster_usage.clamp(min=epsilon).unsqueeze(-1)
+            let cluster_usage_clamped = cluster_usage.clamp(epsilon, f32::MAX)?;
+            let cb = embedding_sum.broadcast_div(&cluster_usage_clamped.unsqueeze(1)?)?;
             rest_codebooks.push(cb);
         }
 
@@ -286,6 +308,12 @@ impl Decoder12Hz {
             layers.push(layer);
         }
         let transformer_weights = TransformerWeights { layers };
+
+        // Load final norm weight
+        let final_norm_weight = weights
+            .get("decoder.pre_transformer.norm.weight")
+            .ok_or_else(|| anyhow::anyhow!("Missing pre_transformer final norm weight"))?
+            .clone();
 
         // Load upsample stages
         let mut upsample_stages = Vec::with_capacity(config.upsampling_ratios.len());
@@ -424,6 +452,7 @@ impl Decoder12Hz {
             input_proj_weight,
             input_proj_bias,
             transformer_weights,
+            final_norm_weight,
             output_proj_weight,
             output_proj_bias,
             upsample_stages,
@@ -445,31 +474,52 @@ impl Decoder12Hz {
         let device = codes.device();
         let (batch_size, _num_quantizers, seq_len) = codes.dims3()?;
 
-        // 1. Quantizer decode - lookup and sum embeddings
-        let mut quantized = Tensor::zeros((batch_size, seq_len, 256), DType::F32, device)?;
+        // Debug logging disabled for production
+        // eprintln!("DEBUG: decode() - batch_size={}, seq_len={}", batch_size, seq_len);
 
-        // First quantizer (semantic)
+        // 1. Quantizer decode - separate projections for first vs rest
+        // Python does: rvq_first.decode() + rvq_rest.decode()
+        // Each calls vq.decode() (sum codebook embeds) then output_proj (Conv1d 256->512)
+
+        // First quantizer (semantic) - single layer
         let first_codes = codes.i((.., 0, ..))?; // [batch, seq]
-        let first_embed = self.first_codebook.index_select(&first_codes.flatten_all()?, 0)?;
+        let first_codes_flat = first_codes.flatten_all()?;
+        let codebook_size = self.config.codebook_size as i64;
+        // Apply modulo to map 3072 vocab → 2048 codebook
+        let first_codes_vec: Vec<i64> = first_codes_flat.to_vec1()?;
+        let first_codes_mod: Vec<i64> = first_codes_vec
+            .iter()
+            .map(|&c| c % codebook_size)
+            .collect();
+        let first_codes_tensor = Tensor::from_vec(first_codes_mod, first_codes_flat.dims(), device)?;
+        let first_embed = self.first_codebook.index_select(&first_codes_tensor, 0)?;
         let first_embed = first_embed.reshape((batch_size, seq_len, 256))?;
-        quantized = (quantized + first_embed)?;
 
-        // Rest quantizers (acoustic)
+        // Apply first output projection: Conv1d expects [batch, channels, seq]
+        // first_embed is [batch, seq, 256], transpose to [batch, 256, seq]
+        let first_embed_t = first_embed.transpose(1, 2)?; // [batch, 256, seq]
+        // first_output_proj is [512, 256, 1] - 1x1 conv
+        let first_proj = self.conv1d_1x1(&first_embed_t, &self.first_output_proj)?; // [batch, 512, seq]
+
+        // Rest quantizers (acoustic) - 15 layers, sum embeddings then project
+        let mut rest_embed = Tensor::zeros((batch_size, seq_len, 256), DType::F32, device)?;
         for i in 0..15 {
             let layer_codes = codes.i((.., i + 1, ..))?;
             let embed = self.rest_codebooks[i].index_select(&layer_codes.flatten_all()?, 0)?;
             let embed = embed.reshape((batch_size, seq_len, 256))?;
-            quantized = (quantized + embed)?;
+            rest_embed = (rest_embed + embed)?;
         }
 
-        // Apply output projection (1x1 conv as linear)
-        // first_output_proj is [512, 256, 1], treat as linear [512, 256]
-        let proj_weight = self.first_output_proj.squeeze(2)?;
-        let quantized = self.linear_3d(&quantized, &proj_weight, None)?; // [batch, seq, 512]
+        // Apply rest output projection
+        let rest_embed_t = rest_embed.transpose(1, 2)?; // [batch, 256, seq]
+        let rest_proj = self.conv1d_1x1(&rest_embed_t, &self.rest_output_proj)?; // [batch, 512, seq]
+
+        // Sum both projected outputs
+        let quantized = (first_proj + rest_proj)?; // [batch, 512, seq]
 
         // 2. Pre-conv
-        let hidden = quantized.transpose(1, 2)?; // [batch, 512, seq]
-        let hidden = self.pre_conv.forward(&hidden)?; // [batch, 1024, seq]
+        // quantized is already [batch, 512, seq] from projections
+        let hidden = self.pre_conv.forward(&quantized)?; // [batch, 1024, seq]
 
         // 3. Pre-transformer
         let hidden = hidden.transpose(1, 2)?; // [batch, seq, 1024]
@@ -477,6 +527,9 @@ impl Decoder12Hz {
 
         // Run transformer layers
         let hidden = self.run_transformer(hidden, seq_len)?;
+
+        // Final norm before output projection
+        let hidden = self.rms_norm(&hidden, &self.final_norm_weight)?;
 
         // Output projection
         let hidden = self.linear_3d(&hidden, &self.output_proj_weight, Some(&self.output_proj_bias))?;
@@ -503,8 +556,26 @@ impl Decoder12Hz {
         // 9. Final conv
         hidden = self.final_conv.forward(&hidden)?;
 
-        // 10. Clamp to [-1, 1]
-        Ok(hidden.clamp(-1.0, 1.0)?)
+        // 10. Clamp to [-1, 1] per official implementation
+        // The decoder outputs values in a large range (e.g., [-27, 27])
+        // Official code uses: wav.clamp(min=-1, max=1)
+        Ok(hidden.clamp(-1.0f32, 1.0f32)?)
+    }
+
+    /// 1x1 convolution (pointwise conv)
+    /// Input: [batch, in_channels, seq_len]
+    /// Weight: [out_channels, in_channels, 1]
+    /// Output: [batch, out_channels, seq_len]
+    fn conv1d_1x1(&self, x: &Tensor, weight: &Tensor) -> Result<Tensor> {
+        let weight_2d = weight.squeeze(2)?; // [out_channels, in_channels]
+        let (batch, in_ch, seq) = x.dims3()?;
+        // Reshape to [batch * seq, in_ch] for matmul
+        let x_t = x.transpose(1, 2)?; // [batch, seq, in_ch]
+        let x_flat = x_t.reshape((batch * seq, in_ch))?;
+        let out_flat = x_flat.matmul(&weight_2d.t()?)?; // [batch * seq, out_ch]
+        let out_ch = out_flat.dim(1)?;
+        let out = out_flat.reshape((batch, seq, out_ch))?;
+        Ok(out.transpose(1, 2)?) // [batch, out_ch, seq]
     }
 
     /// Linear projection for 3D tensors
