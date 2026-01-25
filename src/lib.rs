@@ -61,6 +61,8 @@
 
 pub mod audio;
 pub mod generation;
+#[cfg(feature = "hub")]
+pub mod hub;
 pub mod models;
 pub mod tokenizer;
 
@@ -75,7 +77,10 @@ use models::KVCache;
 
 /// Re-exports for convenience
 pub use audio::AudioBuffer;
+#[cfg(feature = "hub")]
+pub use hub::ModelPaths;
 pub use models::config::Qwen3TTSConfig;
+// StreamingSession is defined in this module, exported as top-level type
 pub use models::talker::{codec_tokens, special_tokens, tts_tokens, Language, Speaker};
 pub use models::Qwen3TTSModel;
 pub use models::{CodePredictor, CodePredictorConfig, TalkerConfig, TalkerModel as Talker};
@@ -182,6 +187,51 @@ impl Qwen3TTS {
         })
     }
 
+    /// Load from downloaded model paths.
+    ///
+    /// Use with [`ModelPaths::download`] for automatic model downloading.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use qwen3_tts::{Qwen3TTS, ModelPaths, auto_device};
+    ///
+    /// let paths = ModelPaths::download(None)?;
+    /// let device = auto_device()?;
+    /// let model = Qwen3TTS::from_paths(&paths, device)?;
+    /// ```
+    #[cfg(feature = "hub")]
+    pub fn from_paths(paths: &hub::ModelPaths, device: Device) -> Result<Self> {
+        tracing::info!("Loading Qwen3-TTS from downloaded paths...");
+
+        // Load text tokenizer
+        let text_tokenizer = tokenizer::TextTokenizer::from_file(&paths.tokenizer)?;
+
+        // Load model weights
+        let weights = Self::load_weights(&paths.model_weights, &device)?;
+
+        // Create TalkerModel
+        let talker = TalkerModel::from_weights(&weights, &device)?;
+
+        // Create CodePredictor
+        let cp_config = CodePredictorConfig::default();
+        let cp_weights = Self::filter_weights(&weights, "talker.code_predictor.");
+        let cp_vb = candle_nn::VarBuilder::from_tensors(cp_weights, DType::F32, &device);
+        let code_predictor = CodePredictor::new(cp_config, cp_vb)?;
+
+        // Load decoder weights
+        let st_weights = Self::load_weights(&paths.decoder_weights, &device)?;
+        let decoder = Decoder12Hz::from_weights(&st_weights, Default::default())?;
+
+        Ok(Self {
+            talker,
+            code_predictor,
+            decoder,
+            text_tokenizer,
+            device,
+        })
+    }
+
     /// Synthesize speech from text using proper autoregressive pipeline
     ///
     /// Pipeline:
@@ -211,6 +261,98 @@ impl Qwen3TTS {
         )?;
 
         // Decode to audio
+        let waveform = self.decoder.decode(&codes)?;
+
+        AudioBuffer::from_tensor(waveform, 24000)
+    }
+
+    /// Synthesize speech with a specific voice and language.
+    ///
+    /// Uses the CustomVoice pipeline with predefined speaker embeddings.
+    /// Requires a CustomVoice model (not the base model).
+    ///
+    /// # Arguments
+    ///
+    /// * `text` - Text to synthesize
+    /// * `speaker` - Predefined speaker voice
+    /// * `language` - Target language
+    /// * `options` - Synthesis options (temperature, top_k, etc.)
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use qwen3_tts::{Qwen3TTS, Speaker, Language, SynthesisOptions};
+    ///
+    /// let audio = model.synthesize_with_voice(
+    ///     "Hello, world!",
+    ///     Speaker::Ryan,
+    ///     Language::English,
+    ///     None,
+    /// )?;
+    /// audio.save("output.wav")?;
+    /// ```
+    pub fn synthesize_with_voice(
+        &self,
+        text: &str,
+        speaker: Speaker,
+        language: Language,
+        options: Option<SynthesisOptions>,
+    ) -> Result<AudioBuffer> {
+        let options = options.unwrap_or_default();
+
+        // Tokenize text
+        let input_ids = self.text_tokenizer.encode(text)?;
+
+        // Generate semantic tokens using CustomVoice pipeline
+        let config = generation::GenerationConfig {
+            max_new_tokens: options.max_length,
+            temperature: options.temperature,
+            top_k: options.top_k,
+            top_p: options.top_p,
+            repetition_penalty: options.repetition_penalty,
+            eos_token_id: options.eos_token_id,
+        };
+
+        let semantic_tokens = self
+            .talker
+            .generate_custom_voice(&input_ids, speaker, language, &config)?;
+
+        // Generate full 16-codebook codes for each semantic token
+        let mut all_codes: Vec<Vec<u32>> = Vec::new();
+
+        // We need hidden states for the code predictor, so we'll use prefill
+        let mut kv_caches = self.talker.new_kv_caches();
+        let (hidden, _) =
+            self.talker
+                .prefill_custom_voice(&input_ids, speaker, language, &mut kv_caches)?;
+        let seq_len = hidden.dim(1)?;
+        let mut last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
+
+        for (i, &semantic_token) in semantic_tokens.iter().enumerate() {
+            // Get codec embedding for this semantic token
+            let semantic_embed = self.talker.get_codec_embedding(semantic_token)?;
+
+            // Generate 15 acoustic tokens
+            let acoustic_codes = self
+                .code_predictor
+                .generate_acoustic_codes(&last_hidden, &semantic_embed)?;
+
+            let mut frame_codes = vec![semantic_token];
+            frame_codes.extend(acoustic_codes);
+            all_codes.push(frame_codes);
+
+            // Update hidden state for next iteration (if not last)
+            if i < semantic_tokens.len() - 1 {
+                let offset = seq_len + i;
+                let (hidden, _) =
+                    self.talker
+                        .generate_step(semantic_token, &mut kv_caches, offset)?;
+                last_hidden = hidden;
+            }
+        }
+
+        // Convert to tensor and decode
+        let codes = self.codes_to_tensor(&all_codes)?;
         let waveform = self.decoder.decode(&codes)?;
 
         AudioBuffer::from_tensor(waveform, 24000)
@@ -316,6 +458,33 @@ impl Qwen3TTS {
         &self.device
     }
 
+    /// Create a streaming synthesis session.
+    ///
+    /// Returns an iterator that yields audio chunks as they are generated.
+    /// Each chunk contains approximately `chunk_frames` frames worth of audio
+    /// (default: 10 frames = ~800ms at 12.5 Hz frame rate).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let options = SynthesisOptions::default();
+    /// for chunk in model.synthesize_streaming("Hello, world!", options)? {
+    ///     let audio = chunk?;
+    ///     // Play or process audio chunk (each ~800ms)
+    /// }
+    /// ```
+    pub fn synthesize_streaming(
+        &self,
+        text: &str,
+        options: SynthesisOptions,
+    ) -> Result<StreamingSession<'_>> {
+        // Tokenize text
+        let input_ids = self.text_tokenizer.encode(text)?;
+        let input_tensor = Tensor::new(input_ids.as_slice(), &self.device)?.unsqueeze(0)?;
+
+        StreamingSession::new(self, input_tensor, options)
+    }
+
     /// Load weights from safetensors file
     fn load_weights(path: &Path, device: &Device) -> Result<HashMap<String, Tensor>> {
         let tensors: HashMap<String, Tensor> = candle_core::safetensors::load(path, device)?;
@@ -352,6 +521,160 @@ impl Qwen3TTS {
 /// Audio end-of-sequence token ID for Qwen3-TTS
 pub const AUDIO_EOS_TOKEN_ID: u32 = 151670;
 
+/// Samples per frame at 24kHz with 12.5 Hz frame rate
+pub const SAMPLES_PER_FRAME: usize = 1920;
+
+/// Streaming synthesis session.
+///
+/// Yields audio chunks as they are generated. Use with `synthesize_streaming`.
+pub struct StreamingSession<'a> {
+    model: &'a Qwen3TTS,
+    config: generation::GenerationConfig,
+    kv_caches: Vec<KVCache>,
+    offset: usize,
+    last_hidden: Tensor,
+    current_token: Option<u32>,
+    frames_generated: usize,
+    frame_buffer: Vec<Vec<u32>>,
+    chunk_frames: usize,
+    done: bool,
+}
+
+impl<'a> StreamingSession<'a> {
+    fn new(model: &'a Qwen3TTS, input_ids: Tensor, options: SynthesisOptions) -> Result<Self> {
+        let config = generation::GenerationConfig {
+            max_new_tokens: options.max_length,
+            temperature: options.temperature,
+            top_k: options.top_k,
+            top_p: options.top_p,
+            repetition_penalty: options.repetition_penalty,
+            eos_token_id: options.eos_token_id,
+        };
+
+        let mut kv_caches = model.talker.new_kv_caches();
+
+        // Prefill with text
+        let (hidden, logits) = model.talker.prefill(&input_ids, &mut kv_caches)?;
+        let offset = input_ids.dim(1)?;
+
+        // Get last hidden state
+        let seq_len = hidden.dim(1)?;
+        let last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
+
+        // Sample first token
+        let first_token = generation::sample(&logits.squeeze(1)?, &config)?;
+        let first_token_id: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
+
+        // Check for immediate EOS
+        let done = config.eos_token_id == Some(first_token_id);
+
+        Ok(Self {
+            model,
+            config,
+            kv_caches,
+            offset,
+            last_hidden,
+            current_token: if done { None } else { Some(first_token_id) },
+            frames_generated: 0,
+            frame_buffer: Vec::new(),
+            chunk_frames: options.chunk_frames,
+            done,
+        })
+    }
+
+    /// Generate the next chunk of audio.
+    ///
+    /// Returns `Some(AudioBuffer)` for each chunk, or `None` when generation is complete.
+    pub fn next_chunk(&mut self) -> Result<Option<AudioBuffer>> {
+        if self.done {
+            // Flush remaining buffer
+            if !self.frame_buffer.is_empty() {
+                let codes = self.model.codes_to_tensor(&self.frame_buffer)?;
+                self.frame_buffer.clear();
+                let audio = self.model.decoder.decode(&codes)?;
+                return Ok(Some(AudioBuffer::from_tensor(audio, 24000)?));
+            }
+            return Ok(None);
+        }
+
+        // Generate frames until we have enough for a chunk
+        while self.frame_buffer.len() < self.chunk_frames
+            && self.frames_generated < self.config.max_new_tokens
+        {
+            let token_id = match self.current_token {
+                Some(id) => id,
+                None => {
+                    self.done = true;
+                    break;
+                }
+            };
+
+            // Generate acoustic codes for this frame
+            let semantic_embed = self.model.talker.get_codec_embedding(token_id)?;
+            let acoustic_codes = self
+                .model
+                .code_predictor
+                .generate_acoustic_codes(&self.last_hidden, &semantic_embed)?;
+
+            let mut frame_codes = vec![token_id];
+            frame_codes.extend(acoustic_codes);
+            self.frame_buffer.push(frame_codes);
+            self.frames_generated += 1;
+
+            // Generate next token
+            let (hidden, logits) =
+                self.model
+                    .talker
+                    .generate_step(token_id, &mut self.kv_caches, self.offset)?;
+            self.offset += 1;
+            self.last_hidden = hidden;
+
+            let next_token = generation::sample(&logits.squeeze(1)?, &self.config)?;
+            let next_token_id: u32 = next_token.flatten_all()?.to_vec1::<u32>()?[0];
+
+            // Check for EOS
+            if self.config.eos_token_id == Some(next_token_id) {
+                self.current_token = None;
+                self.done = true;
+            } else {
+                self.current_token = Some(next_token_id);
+            }
+        }
+
+        // Decode the buffered frames
+        if self.frame_buffer.is_empty() {
+            return Ok(None);
+        }
+
+        let codes = self.model.codes_to_tensor(&self.frame_buffer)?;
+        self.frame_buffer.clear();
+        let audio = self.model.decoder.decode(&codes)?;
+        Ok(Some(AudioBuffer::from_tensor(audio, 24000)?))
+    }
+
+    /// Returns the total number of frames generated so far.
+    pub fn frames_generated(&self) -> usize {
+        self.frames_generated
+    }
+
+    /// Returns true if generation is complete.
+    pub fn is_done(&self) -> bool {
+        self.done && self.frame_buffer.is_empty()
+    }
+}
+
+impl<'a> Iterator for StreamingSession<'a> {
+    type Item = Result<AudioBuffer>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.next_chunk() {
+            Ok(Some(audio)) => Some(Ok(audio)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
 /// Options for speech synthesis
 #[derive(Debug, Clone)]
 pub struct SynthesisOptions {
@@ -371,6 +694,8 @@ pub struct SynthesisOptions {
     pub language: Option<String>,
     /// End-of-sequence token ID (defaults to audio_end token 151670)
     pub eos_token_id: Option<u32>,
+    /// Frames per streaming chunk (default: 10 = ~800ms)
+    pub chunk_frames: usize,
 }
 
 impl Default for SynthesisOptions {
@@ -384,6 +709,7 @@ impl Default for SynthesisOptions {
             speaker_embedding: None,
             language: None,
             eos_token_id: Some(AUDIO_EOS_TOKEN_ID),
+            chunk_frames: 10, // ~800ms per chunk at 12.5 Hz
         }
     }
 }
@@ -442,6 +768,7 @@ mod tests {
         assert!(options.speaker_embedding.is_none());
         assert!(options.language.is_none());
         assert_eq!(options.eos_token_id, Some(AUDIO_EOS_TOKEN_ID));
+        assert_eq!(options.chunk_frames, 10);
     }
 
     #[test]
@@ -455,11 +782,13 @@ mod tests {
             speaker_embedding: None,
             language: Some("en".to_string()),
             eos_token_id: Some(AUDIO_EOS_TOKEN_ID),
+            chunk_frames: 5,
         };
         assert_eq!(options.max_length, 512);
         assert!((options.temperature - 0.5).abs() < 1e-6);
         assert_eq!(options.language, Some("en".to_string()));
         assert_eq!(options.eos_token_id, Some(151670));
+        assert_eq!(options.chunk_frames, 5);
     }
 
     #[test]

@@ -51,13 +51,11 @@ impl CausalTransConv1d {
 
         let conv = conv_transpose1d(in_channels, out_channels, kernel_size, config, vb)?;
 
-        // Match official Qwen3-TTS implementation:
-        // pad = kernel_size - stride
-        // left_pad = ceil(pad)
-        // right_pad = left_pad (same as left)
-        let pad = kernel_size.saturating_sub(stride);
-        let left_trim = pad; // ceil(pad) where pad is already integer
-        let right_trim = left_trim;
+        // Match official Qwen3-TTS/Mimi implementation:
+        // Only trim from the right side for exact input * stride output
+        // This maintains causality while preserving length
+        let right_trim = kernel_size.saturating_sub(stride);
+        let left_trim = 0;
 
         Ok(Self {
             conv,
@@ -82,13 +80,11 @@ impl CausalTransConv1d {
 
         let conv = ConvTranspose1d::new(weight, bias, config);
 
-        // Match official Qwen3-TTS implementation:
-        // pad = kernel_size - stride
-        // left_pad = ceil(pad)
-        // right_pad = left_pad (same as left)
-        let pad = kernel_size.saturating_sub(stride);
-        let left_trim = pad; // ceil(pad) where pad is already integer
-        let right_trim = left_trim;
+        // Match official Qwen3-TTS/Mimi implementation:
+        // Only trim from the right side for exact input * stride output
+        // This maintains causality while preserving length
+        let right_trim = kernel_size.saturating_sub(stride);
+        let left_trim = 0;
 
         Ok(Self {
             conv,
@@ -144,17 +140,17 @@ mod tests {
 
         let conv = CausalTransConv1d::from_weights(weight, Some(bias), 2).unwrap();
 
-        // Verify trimming matches official: trim = kernel - stride = 2 from each side
-        assert_eq!(conv.left_trim, 2);
+        // Official behavior: trim only from right side
+        assert_eq!(conv.left_trim, 0);
         assert_eq!(conv.right_trim, 2);
 
         // Input: [batch=1, channels=64, seq=10]
         let input = Tensor::randn(0.0f32, 1.0, (1, 64, 10), &device).unwrap();
         let output = conv.forward(&input).unwrap();
 
-        // Official behavior: raw = (10-1)*2 + 4 = 22, trim 4 total -> 18
-        // This is (input - 1) * stride when kernel = 2 * stride
-        assert_eq!(output.dims(), &[1, 32, 18]);
+        // Output: raw = (10-1)*2 + 4 = 22, trim 2 from right -> 20 = 10 * 2
+        // This gives exact input * stride upsampling
+        assert_eq!(output.dims(), &[1, 32, 20]);
     }
 
     #[test]
@@ -183,12 +179,12 @@ mod tests {
         let device = Device::Cpu;
 
         // (kernel, stride) -> expected output for input_len=4
-        // Official formula: output = (input - 1) * stride when kernel = 2 * stride
+        // Official formula: output = input * stride (exact upsampling with right-only trim)
         let test_cases = [
-            (16, 8, 24), // (4-1)*8 = 24
-            (10, 5, 15), // (4-1)*5 = 15
-            (8, 4, 12),  // (4-1)*4 = 12
-            (6, 3, 9),   // (4-1)*3 = 9
+            (16, 8, 32), // 4*8 = 32
+            (10, 5, 20), // 4*5 = 20
+            (8, 4, 16),  // 4*4 = 16
+            (6, 3, 12),  // 4*3 = 12
         ];
 
         for (kernel_size, stride, expected_len) in test_cases {
@@ -197,10 +193,10 @@ mod tests {
 
             let conv = CausalTransConv1d::from_weights(weight, Some(bias), stride).unwrap();
 
-            // Verify trimming: pad = kernel - stride, trim from both sides
-            let expected_trim = kernel_size - stride;
-            assert_eq!(conv.left_trim, expected_trim);
-            assert_eq!(conv.right_trim, expected_trim);
+            // Verify trimming: only trim from right side
+            let expected_right_trim = kernel_size - stride;
+            assert_eq!(conv.left_trim, 0);
+            assert_eq!(conv.right_trim, expected_right_trim);
 
             let input = Tensor::randn(0.0f32, 1.0, (1, 16, 4), &device).unwrap();
             let output = conv.forward(&input).unwrap();

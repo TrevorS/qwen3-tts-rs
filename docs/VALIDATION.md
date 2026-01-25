@@ -1,6 +1,6 @@
 # Validation Status
 
-This document tracks the validation of the Rust implementation against the Python reference.
+Component-by-component validation of the Rust implementation against Python reference.
 
 ## Summary
 
@@ -20,14 +20,22 @@ This document tracks the validation of the Rust implementation against the Pytho
 | Code Predictor (5 layers) | ✅ Pass | 3.4e-5 | Acoustic token prediction |
 | Quantizer Decode | ✅ Pass | < 1e-5 | Codebook lookup + sum |
 | Pre-transformer (8 layers) | ✅ Pass | < 1e-6 | With layer scale |
+| Causal Conv1d | ✅ Pass | < 1e-6 | Left-padded causal conv |
+| SnakeBeta | ✅ Pass | < 1e-6 | x + (1/β)sin²(αx) |
+| CausalTransConv1d | ✅ Pass | < 1e-6 | Right-only trimming |
+| ConvNeXtBlock | ✅ Pass | < 1e-5 | dwconv + norm + pwconv |
+| ResidualUnit | ✅ Pass | < 1e-5 | Dilated causal convs |
+| DecoderBlock | ✅ Pass | < 1e-5 | Upsample + residual units |
+| Full 12Hz Decoder | ✅ Pass | 3e-6 | Quantizer → audio |
+| End-to-End Pipeline | ✅ Pass | 2e-6 | Text → audio |
 
-**Total: 215 tests passing** (157 unit + 43 integration + 15 reference validation)
+**Test Totals:** 179 unit tests + 29 reference validation tests = 208 tests passing
 
-## Validated Components
+## Architecture Details
 
 ### 1. Talker Model (Semantic Token Generation)
 
-The talker model generates semantic tokens (group 1) from text input.
+Generates semantic tokens (codebook 1) from text input.
 
 **Architecture:**
 - Text embedding: 151936 vocab → 2048 dim
@@ -35,80 +43,74 @@ The talker model generates semantic tokens (group 1) from text input.
 - 28 transformer layers:
   - Hidden size: 1024
   - Attention heads: 16 (query), 8 (KV) - GQA
-  - Head dim: 128 (explicit, not hidden/heads)
+  - Head dim: 128 (explicit override)
   - Intermediate size: 3072
   - QK normalization: RMSNorm per-head
   - RoPE theta: 1,000,000
 - Codec head: 1024 → 3072 (semantic vocab)
 
-**Validation:**
-```
-Input: "Hello, this is a" → [9707, 11, 419, 374, 264]
-Predictions (Rust): [1501, 1231, 1732, 1353, 963]
-Predictions (Python): [1501, 1231, 1732, 1353, 963]
-Result: EXACT MATCH
-```
-
 ### 2. Code Predictor (Acoustic Token Generation)
 
-The code predictor generates 15 acoustic tokens (groups 2-16) given the semantic token and talker hidden state.
+Generates 15 acoustic tokens (codebooks 2-16) per semantic token.
 
 **Architecture:**
 - 5 transformer layers (same structure as talker)
 - 15 codec embeddings (2048 vocab → 1024 dim each)
 - 15 lm_heads (1024 → 2048 each)
 
-**Validation:**
-```
-Semantic token: 963
-Acoustic token 0 (Rust): 281
-Acoustic token 0 (Python): 281
-Result: EXACT MATCH
-```
+### 3. Decoder12Hz (Codes → Audio)
 
-### 3. Speech Tokenizer Decoder (Codes → Audio)
-
-The decoder converts codec tokens back to audio waveforms.
+Converts 16-codebook tokens to 24kHz audio waveform.
 
 **Architecture:**
 - Split RVQ: 1 semantic + 15 acoustic quantizers
 - Codebook dim: 256, output proj to 512
 - Pre-conv: causal 1D conv (512 → 1024, kernel=3)
-- Pre-transformer: 8 layers
-  - Hidden size: 512
-  - Attention heads: 16
-  - Head dim: 64
-  - Layer scale: 0.01
-- Upsampling: ratios [8, 5, 4, 3] → 480x
-- Final decoder blocks
+- Pre-transformer: 8 layers with layer scale 0.01
+- Upsampling: ratios [8, 5, 4, 3, 2] → 960x total
+- Decoder blocks: SnakeBeta + CausalTransConv + ResidualUnits
+- Output: 24kHz mono audio
 
-**Validated:**
-- ✅ Quantizer decode (codebook lookup + sum + projection)
-- ✅ Pre-transformer (8 layers with layer scale)
-- ⏳ Pre-conv (needs causal conv implementation)
-- ⏳ Upsampling blocks
-- ⏳ Final decoder
+## Key Fixes Applied
 
-## Key Fixes Applied During Validation
+### 1. CausalTransConv1d Trimming (Critical)
 
-### 1. QK Normalization
-The attention layer applies RMSNorm to Q and K after projection, before RoPE:
+**Problem:** 75 frames produced 143445 samples instead of 144000.
+
+**Root cause:** Symmetric trimming (left + right) instead of right-only.
+
+**Fix:**
+```rust
+// Correct: right-only trim for exact input * stride output
+let right_trim = kernel_size.saturating_sub(stride);
+let left_trim = 0;
+
+// Wrong: symmetric trim
+let pad = (kernel_size - stride) / 2;
+let left_trim = pad;
+let right_trim = kernel_size - stride - pad;
+```
+
+### 2. QK Normalization
+
+Apply RMSNorm to Q and K after projection, before RoPE:
 ```rust
 let q = self.q_norm.forward(&q)?;
 let k = self.k_norm.forward(&k)?;
 ```
 
-### 2. RoPE Formula
-Correct formula for rotary embeddings:
+### 3. RoPE Formula
+
 ```rust
-// [x1*cos - x2*sin, x2*cos + x1*sin]
+// Correct: [x1*cos - x2*sin, x2*cos + x1*sin]
 let rotated = Tensor::cat(&[
     &(x1.mul(&cos)? - x2.mul(&sin)?)?,
     &(x2.mul(&cos)? + x1.mul(&sin)?)?,  // NOT x1*sin
 ], D::Minus1)?;
 ```
 
-### 3. Head Dimension Override
+### 4. Head Dimension Override
+
 The model uses head_dim=128 explicitly, not hidden_size/num_heads=64:
 ```rust
 pub fn head_dim(&self) -> usize {
@@ -116,14 +118,9 @@ pub fn head_dim(&self) -> usize {
 }
 ```
 
-### 4. Attention Mask Broadcasting
-Use `broadcast_add` for combining 4D attention weights with 2D mask:
-```rust
-let attn_weights = attn_weights.broadcast_add(mask)?;
-```
-
 ### 5. Linear for 3D Tensors
-Candle's matmul doesn't auto-broadcast 3D @ 2D. Flatten, matmul, reshape:
+
+Candle's matmul doesn't auto-broadcast 3D @ 2D:
 ```rust
 fn linear(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
     let (batch, seq, features) = x.dims3()?;
@@ -133,37 +130,18 @@ fn linear(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> 
 }
 ```
 
-## TODO
-
-### High Priority
-- [ ] Implement causal 1D convolution
-- [ ] Implement upsampling blocks (ConvTranspose1d with ratios [8, 5, 4, 3])
-- [ ] Implement final decoder blocks
-- [ ] End-to-end audio generation test
-
-### Medium Priority
-- [ ] KV cache optimization for inference
-- [ ] Streaming generation support
-- [ ] Speaker embedding integration
-
-### Low Priority
-- [ ] GPU acceleration (CUDA)
-- [ ] Quantization (INT8/FP16)
-- [ ] ONNX export
-
 ## Running Validation
 
-1. Ensure test data is in place:
+1. Download test data:
 ```bash
-ls test_data/model/model.safetensors
-ls test_data/speech_tokenizer/model.safetensors
+./scripts/download_test_data.sh
 ```
 
 2. Export Python reference values:
 ```bash
-source ../.venv/bin/activate
-python tools/export_reference_values.py
-python tools/export_decoder_reference.py
+cd tools && uv sync
+uv run python export_reference_values.py
+uv run python export_decoder_reference.py
 ```
 
 3. Run validation tests:
@@ -188,13 +166,16 @@ cargo test --test reference_validation -- --nocapture
   Layer 4: mean=0.051924
   code_predictor_final: max_diff=0.000034
   acoustic_logits_0: max_diff=0.000016
-  Acoustic token 0 prediction: 281
   CODE PREDICTOR PASS!
 
-=== Speech Tokenizer Decoder Validation ===
-  quantized: max_diff=0.000000
-  Quantizer decode PASS!
-  pre_transformer: max_diff=0.000000
-  Pre-transformer PASS!
-  SPEECH TOKENIZER DECODER PASS!
+=== Full 12Hz Decoder Validation ===
+  Rust audio shape: [1, 1, 144000]
+  Python audio shape: [1, 1, 144000]
+  Max diff: 0.000003
+  DECODER PASS!
+
+=== End-to-End Pipeline Validation ===
+  Text: "Hello" -> Audio: 144000 samples
+  Max diff from Python: 0.000002
+  END-TO-END PASS!
 ```

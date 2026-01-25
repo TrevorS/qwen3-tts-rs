@@ -486,11 +486,10 @@ def export_e2e_reference():
         stride = rate
 
         x = torch.nn.functional.conv_transpose1d(x, conv_w, conv_b, stride=stride)
-        # Trim from both sides to match official Qwen3-TTS model
-        # pad = kernel_size - stride, trim ceil(pad) from each side
+        # Trim from right side only for exact input * stride upsampling
         trim = kernel_size - stride
         if trim > 0:
-            x = x[..., trim:-trim]
+            x = x[..., :-trim]
 
         # ResidualUnits
         for unit_idx, dilation in enumerate([1, 3, 9], start=2):

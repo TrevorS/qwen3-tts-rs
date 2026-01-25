@@ -378,11 +378,10 @@ def export_decoder_reference():
         stride = rate
 
         hidden = torch.nn.functional.conv_transpose1d(hidden, conv_w, conv_b, stride=stride)
-        # Trim from both sides to match official Qwen3-TTS model
-        # pad = kernel_size - stride, trim ceil(pad) from each side
+        # Trim from right side only for exact input * stride upsampling
         trim = kernel_size - stride
         if trim > 0:
-            hidden = hidden[..., trim:-trim]
+            hidden = hidden[..., :-trim]
         print(f"    After TransConv (rate={rate}): {hidden.shape}")
 
         # block.2-4: 3 ResidualUnits (dilations 1, 3, 9)
