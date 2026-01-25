@@ -252,7 +252,6 @@ fn main() -> Result<()> {
 
     let mut all_codes: Vec<Vec<u32>> = vec![];
     let mut prev_semantic = first_token_id;
-    let mut generation_step = 0usize;
 
     // Generation loop - each iteration processes prev_semantic and predicts next
     for frame_idx in 0..args.frames {
@@ -289,14 +288,12 @@ fn main() -> Result<()> {
         let mut input_embed = semantic_embed.add(&acoustic_sum)?;
 
         // Add trailing text or tts_pad
-        let text_to_add = if generation_step < trailing_len {
-            trailing_text_hidden.i((.., generation_step..generation_step + 1, ..))?
+        let text_to_add = if frame_idx < trailing_len {
+            trailing_text_hidden.i((.., frame_idx..frame_idx + 1, ..))?
         } else {
             tts_pad_embed.clone()
         };
         input_embed = input_embed.add(&text_to_add)?;
-
-        generation_step += 1;
 
         // Forward through talker
         let (hidden, logits) = talker.generate_step_with_embed(&input_embed, &mut kv_caches, offset)?;

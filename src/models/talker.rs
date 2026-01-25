@@ -848,17 +848,6 @@ impl TalkerModel {
         kv_caches: &mut [KVCache],
         offset: usize,
     ) -> Result<(Tensor, Tensor)> {
-        self.generate_step_with_embed_debug(input_embed, kv_caches, offset, false)
-    }
-
-    /// Generate step with debug output
-    pub fn generate_step_with_embed_debug(
-        &self,
-        input_embed: &Tensor,
-        kv_caches: &mut [KVCache],
-        offset: usize,
-        debug: bool,
-    ) -> Result<(Tensor, Tensor)> {
         // Create causal mask for single token (attends to all previous positions)
         let mask = self.create_causal_mask(1, offset)?;
 
@@ -872,42 +861,13 @@ impl TalkerModel {
                 Some(&mut kv_caches[i]),
                 offset,
             )?;
-
-            if debug && i == 0 {
-                let sum: f32 = hidden.flatten_all()?.to_vec1::<f32>()?.iter().sum();
-                eprintln!("DEBUG: After layer 0, hidden_sum={:.4}", sum);
-            }
         }
 
         // Final norm
-        let hidden_before_norm = hidden.clone();
         hidden = self.rms_norm(&hidden, &self.norm_weight)?;
-
-        if debug {
-            let sum_before: f32 = hidden_before_norm.flatten_all()?.to_vec1::<f32>()?.iter().sum();
-            let sum_after: f32 = hidden.flatten_all()?.to_vec1::<f32>()?.iter().sum();
-            eprintln!("DEBUG: hidden_sum BEFORE norm={:.4}, AFTER norm={:.4}", sum_before, sum_after);
-
-            // Debug codec_head
-            eprintln!("DEBUG: codec_head weight shape: {:?}", self.codec_head.dims());
-            let head_sum: f32 = self.codec_head.flatten_all()?.to_vec1::<f32>()?.iter().sum();
-            eprintln!("DEBUG: codec_head weight sum: {:.4}", head_sum);
-        }
 
         // Get logits
         let logits = self.linear(&hidden, &self.codec_head, None)?;
-
-        if debug {
-            let logits_sum: f32 = logits.flatten_all()?.to_vec1::<f32>()?.iter().sum();
-            eprintln!("DEBUG: logits sum: {:.4}", logits_sum);
-
-            // Check specific logit values
-            let logits_vec: Vec<f32> = logits.flatten_all()?.to_vec1()?;
-            eprintln!("DEBUG: logits[0:5]: {:?}", &logits_vec[0..5]);
-            eprintln!("DEBUG: logits[210]: {:.4}", logits_vec[210]);
-            eprintln!("DEBUG: logits[415]: {:.4}", logits_vec[415]);
-            eprintln!("DEBUG: logits[1028]: {:.4}", logits_vec[1028]);
-        }
 
         Ok((hidden, logits))
     }

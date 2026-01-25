@@ -204,61 +204,6 @@ impl ResidualVectorQuantizer {
     }
 }
 
-/// Split Residual Vector Quantizer
-///
-/// Variant that splits quantizers into semantic (first N) and acoustic groups,
-/// commonly used in speech codecs.
-#[allow(dead_code)]
-pub struct SplitResidualVectorQuantizer {
-    /// Semantic quantizers (typically 1)
-    semantic_quantizers: ResidualVectorQuantizer,
-    /// Acoustic quantizers (typically 15)
-    acoustic_quantizers: ResidualVectorQuantizer,
-    /// Number of semantic quantizers
-    num_semantic: usize,
-}
-
-#[allow(dead_code)]
-impl SplitResidualVectorQuantizer {
-    /// Create new split RVQ
-    pub fn new(
-        num_semantic: usize,
-        num_acoustic: usize,
-        codebook_size: usize,
-        dim: usize,
-        vb: VarBuilder,
-    ) -> Result<Self> {
-        let semantic_quantizers =
-            ResidualVectorQuantizer::new(num_semantic, codebook_size, dim, vb.pp("semantic"))?;
-
-        let acoustic_quantizers =
-            ResidualVectorQuantizer::new(num_acoustic, codebook_size, dim, vb.pp("acoustic"))?;
-
-        Ok(Self {
-            semantic_quantizers,
-            acoustic_quantizers,
-            num_semantic,
-        })
-    }
-
-    /// Decode semantic indices only
-    pub fn decode_semantic(&self, indices: &Tensor) -> Result<Tensor> {
-        self.semantic_quantizers.decode_sum(indices)
-    }
-
-    /// Decode acoustic indices only
-    pub fn decode_acoustic(&self, indices: &Tensor) -> Result<Tensor> {
-        self.acoustic_quantizers.decode_sum(indices)
-    }
-
-    /// Decode all indices
-    pub fn decode(&self, semantic_indices: &Tensor, acoustic_indices: &Tensor) -> Result<Tensor> {
-        let semantic = self.semantic_quantizers.decode_sum(semantic_indices)?;
-        let acoustic = self.acoustic_quantizers.decode_sum(acoustic_indices)?;
-        Ok((semantic + acoustic)?)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,57 +290,6 @@ mod tests {
 
         let decoded = rvq.decode_sum(&indices).unwrap();
         // Should be [batch, seq, dim]
-        assert_eq!(decoded.dims(), &[2, 3, 64]);
-    }
-
-    #[test]
-    fn test_split_rvq_new() {
-        let device = Device::Cpu;
-        let vb = create_mock_vb(&device);
-        let split_rvq = SplitResidualVectorQuantizer::new(1, 15, 128, 64, vb).unwrap();
-        // Just test construction succeeds
-        assert_eq!(split_rvq.num_semantic, 1);
-    }
-
-    #[test]
-    fn test_split_rvq_decode_semantic() {
-        let device = Device::Cpu;
-        let vb = create_mock_vb(&device);
-        let split_rvq = SplitResidualVectorQuantizer::new(1, 15, 128, 64, vb).unwrap();
-
-        // Semantic indices: [batch=2, num_semantic=1, seq=3]
-        let indices = Tensor::zeros((2, 1, 3), DType::U32, &device).unwrap();
-
-        let decoded = split_rvq.decode_semantic(&indices).unwrap();
-        assert_eq!(decoded.dims(), &[2, 3, 64]);
-    }
-
-    #[test]
-    fn test_split_rvq_decode_acoustic() {
-        let device = Device::Cpu;
-        let vb = create_mock_vb(&device);
-        let split_rvq = SplitResidualVectorQuantizer::new(1, 15, 128, 64, vb).unwrap();
-
-        // Acoustic indices: [batch=2, num_acoustic=15, seq=3]
-        let indices = Tensor::zeros((2, 15, 3), DType::U32, &device).unwrap();
-
-        let decoded = split_rvq.decode_acoustic(&indices).unwrap();
-        assert_eq!(decoded.dims(), &[2, 3, 64]);
-    }
-
-    #[test]
-    fn test_split_rvq_decode_both() {
-        let device = Device::Cpu;
-        let vb = create_mock_vb(&device);
-        let split_rvq = SplitResidualVectorQuantizer::new(1, 15, 128, 64, vb).unwrap();
-
-        // Create indices
-        let semantic_indices = Tensor::zeros((2, 1, 3), DType::U32, &device).unwrap();
-        let acoustic_indices = Tensor::zeros((2, 15, 3), DType::U32, &device).unwrap();
-
-        let decoded = split_rvq
-            .decode(&semantic_indices, &acoustic_indices)
-            .unwrap();
         assert_eq!(decoded.dims(), &[2, 3, 64]);
     }
 

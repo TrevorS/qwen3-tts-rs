@@ -229,8 +229,7 @@ impl DecoderTransformerLayer {
 
 /// Main codec decoder
 pub struct CodecDecoder {
-    #[allow(dead_code)]
-    config: DecoderConfig,
+    _config: DecoderConfig,
     /// Vector quantizer for codebook lookups
     quantizer: ResidualVectorQuantizer,
     /// Input projection from codebook embeddings
@@ -245,8 +244,7 @@ pub struct CodecDecoder {
     residual_blocks: Vec<Vec<ResidualBlock>>,
     /// Final convolution to audio
     final_conv: Conv1d,
-    #[allow(dead_code)]
-    device: Device,
+    _device: Device,
 }
 
 impl CodecDecoder {
@@ -321,7 +319,7 @@ impl CodecDecoder {
         )?;
 
         Ok(Self {
-            config,
+            _config: config,
             quantizer,
             input_proj,
             pre_transformer,
@@ -329,7 +327,7 @@ impl CodecDecoder {
             upsample_blocks,
             residual_blocks,
             final_conv,
-            device,
+            _device: device,
         })
     }
 

@@ -474,9 +474,6 @@ impl Decoder12Hz {
         let device = codes.device();
         let (batch_size, _num_quantizers, seq_len) = codes.dims3()?;
 
-        // Debug logging disabled for production
-        // eprintln!("DEBUG: decode() - batch_size={}, seq_len={}", batch_size, seq_len);
-
         // 1. Quantizer decode - separate projections for first vs rest
         // Python does: rvq_first.decode() + rvq_rest.decode()
         // Each calls vq.decode() (sum codebook embeds) then output_proj (Conv1d 256->512)

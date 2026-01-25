@@ -14,8 +14,7 @@ use crate::generation::GenerationConfig;
 pub struct RotaryEmbedding {
     cos: Tensor,
     sin: Tensor,
-    #[allow(dead_code)]
-    dim: usize,
+    _dim: usize,
 }
 
 impl RotaryEmbedding {
@@ -33,7 +32,7 @@ impl RotaryEmbedding {
         let cos = freqs.cos()?;
         let sin = freqs.sin()?;
 
-        Ok(Self { cos, sin, dim })
+        Ok(Self { cos, sin, _dim: dim })
     }
 
     pub fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
@@ -97,6 +96,7 @@ impl MRoPE {
     /// - 24 frequency pairs for temporal (T)
     /// - 20 frequency pairs for height (H)
     /// - 20 frequency pairs for width (W)
+    ///
     /// Total = 64 = head_dim / 2
     pub fn new(
         dim: usize,
@@ -496,8 +496,7 @@ pub struct Qwen3TTSModel {
     norm: RmsNorm,
     lm_head: Linear,
     rope: RotaryEmbedding,
-    #[allow(dead_code)]
-    config: Qwen3TTSConfig,
+    _config: Qwen3TTSConfig,
     device: Device,
 }
 
@@ -547,7 +546,7 @@ impl Qwen3TTSModel {
             norm,
             lm_head,
             rope,
-            config,
+            _config: config,
             device,
         })
     }
@@ -670,7 +669,8 @@ mod tests {
     fn test_rotary_embedding_creation() {
         let device = Device::Cpu;
         let rope = RotaryEmbedding::new(64, 512, 10000.0, &device).unwrap();
-        assert_eq!(rope.dim, 64);
+        // Verify cos/sin shapes match expected dim
+        assert_eq!(rope.cos.dims()[1], 32); // dim / 2
     }
 
     #[test]
@@ -845,7 +845,7 @@ mod tests {
         let model = Qwen3TTSModel::new(config.clone(), vb).unwrap();
 
         assert_eq!(model.layers.len(), 2);
-        assert_eq!(model.config.hidden_size, 64);
+        assert_eq!(config.hidden_size, 64);
     }
 
     #[test]

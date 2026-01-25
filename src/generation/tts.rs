@@ -8,7 +8,7 @@
 //! - Residual VQ pattern (summing all 16 embeddings)
 
 use anyhow::Result;
-use candle_core::{Device, IndexOp, Tensor};
+use candle_core::{Device, Tensor};
 use std::collections::HashMap;
 
 /// TTS-specific token IDs
@@ -197,7 +197,7 @@ pub fn build_prefill_embeddings(
     // We need (control_len - 2) pad tokens, then tts_bos
     let mut text_control_ids = vec![token_ids.tts_pad; control_len - 2];
     text_control_ids.push(token_ids.tts_bos);
-    let text_control_embed = project_text(&text_control_ids.iter().map(|&x| x).collect::<Vec<_>>())?;
+    let text_control_embed = project_text(&text_control_ids)?;
     // [1, control_len - 1, hidden]
 
     // Step 4: Fuse text_control + codec_control[:-1] by ADDITION
@@ -218,17 +218,6 @@ pub fn build_prefill_embeddings(
     // Step 6: Concatenate everything
     let prefill_embed = Tensor::cat(&[&role_prefix_embed, &fused_control, &first_input], 1)?;
     // [1, 3 + (control_len - 1) + 1 = control_len + 3, hidden]
-
-    // Debug: print first 5 values of each position
-    if std::env::var("DEBUG_PREFILL").is_ok() {
-        println!("DEBUG prefill shape: {:?}", prefill_embed.shape());
-        let prefill_2d = prefill_embed.squeeze(0).unwrap();
-        for i in 0..prefill_2d.dim(0).unwrap().min(9) {
-            let row = prefill_2d.i(i).unwrap();
-            let vals: Vec<f32> = row.narrow(0, 0, 5).unwrap().to_vec1().unwrap();
-            println!("DEBUG prefill[{},:5]: {:?}", i, vals);
-        }
-    }
 
     // Step 7: Build trailing text embeddings
     let trailing_embed = if text_token_ids.len() > 1 {

@@ -34,8 +34,7 @@ use super::config::AudioCodecConfig;
 pub struct AudioCodec {
     config: AudioCodecConfig,
     decoder: CodecDecoder,
-    #[allow(dead_code)]
-    device: Device,
+    _device: Device,
 }
 
 impl AudioCodec {
@@ -50,7 +49,7 @@ impl AudioCodec {
         Self {
             config,
             decoder,
-            device,
+            _device: device,
         }
     }
 

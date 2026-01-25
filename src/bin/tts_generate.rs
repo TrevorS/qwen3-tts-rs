@@ -47,20 +47,6 @@ struct Args {
     output: String,
 }
 
-/// ChatML special token IDs
-const IM_START: u32 = 151644;
-const IM_END: u32 = 151645;
-const ASSISTANT_TOKEN: u32 = 77091;
-const NEWLINE_TOKEN: u32 = 198;
-
-/// Build ChatML-formatted token sequence: <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
-fn build_chatml_ids(text_ids: &[u32]) -> Vec<u32> {
-    let mut ids = vec![IM_START, ASSISTANT_TOKEN, NEWLINE_TOKEN];
-    ids.extend_from_slice(text_ids);
-    ids.extend_from_slice(&[IM_END, NEWLINE_TOKEN, IM_START, ASSISTANT_TOKEN, NEWLINE_TOKEN]);
-    ids
-}
-
 /// Simple text to token mapping (raw text tokens only)
 fn text_to_raw_ids(text: &str) -> Vec<u32> {
     match text {
