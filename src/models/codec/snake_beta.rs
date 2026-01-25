@@ -13,7 +13,7 @@ use candle_nn::VarBuilder;
 /// SnakeBeta activation function
 ///
 /// Reference: "Neural Networks Fail to Learn Periodic Functions and How to Fix It"
-/// (https://arxiv.org/abs/2006.08195)
+/// (<https://arxiv.org/abs/2006.08195>)
 pub struct SnakeBeta {
     /// Learned frequency parameter (exponentiated before use)
     alpha: Tensor,
@@ -27,7 +27,7 @@ impl SnakeBeta {
     /// Create a new SnakeBeta activation.
     ///
     /// # Arguments
-    /// * `channels` - Number of channels (alpha and beta have shape [channels])
+    /// * `channels` - Number of channels (alpha and beta have shape `[channels]`)
     /// * `vb` - Variable builder for loading weights
     pub fn new(channels: usize, vb: VarBuilder) -> Result<Self> {
         let alpha = vb.get((channels,), "alpha")?;
@@ -42,7 +42,7 @@ impl SnakeBeta {
 
     /// Create from raw weight tensors.
     ///
-    /// Alpha and beta should have shape [channels].
+    /// Alpha and beta should have shape `[channels]`.
     pub fn from_weights(alpha: Tensor, beta: Tensor) -> Result<Self> {
         Ok(Self {
             alpha,

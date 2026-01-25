@@ -1,16 +1,34 @@
-//! Audio I/O utilities
+//! Audio I/O utilities for loading, saving, and manipulating audio.
 
 use anyhow::{Context, Result};
 use candle_core::Tensor;
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use std::path::Path;
 
-/// Audio buffer holding raw waveform data
+/// Audio buffer holding raw waveform data.
+///
+/// This is the primary output type from synthesis. Samples are stored as
+/// 32-bit floats in the range \[-1.0, 1.0\].
+///
+/// # Example
+///
+/// ```rust,ignore
+/// // From synthesis
+/// let audio = model.synthesize("Hello!", None)?;
+/// audio.save("output.wav")?;
+///
+/// // From file
+/// let audio = AudioBuffer::load("input.wav")?;
+/// println!("Duration: {:.2}s", audio.duration());
+///
+/// // Convert to tensor for processing
+/// let tensor = audio.to_tensor(&device)?;
+/// ```
 #[derive(Debug, Clone)]
 pub struct AudioBuffer {
-    /// Mono audio samples in [-1.0, 1.0] range
+    /// Mono audio samples in \[-1.0, 1.0\] range
     pub samples: Vec<f32>,
-    /// Sample rate in Hz
+    /// Sample rate in Hz (typically 24000 for Qwen3-TTS)
     pub sample_rate: u32,
 }
 
@@ -23,7 +41,7 @@ impl AudioBuffer {
         }
     }
 
-    /// Create from a Candle tensor (assumed shape: [samples] or [1, samples])
+    /// Create from a Candle tensor (assumed shape: `[samples]` or `[1, samples]`)
     pub fn from_tensor(tensor: Tensor, sample_rate: u32) -> Result<Self> {
         let tensor = if tensor.dims().len() == 2 {
             tensor.squeeze(0)?

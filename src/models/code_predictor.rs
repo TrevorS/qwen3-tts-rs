@@ -266,9 +266,9 @@ impl CodePredictor {
     /// depends on the previous one.
     ///
     /// Flow:
-    /// 1. Prefill: [talker_hidden, semantic_embed] → lm_head[0] → acoustic_0
-    /// 2. Step 1: embed(acoustic_0) via codec_embedding[0] → lm_head[1] → acoustic_1
-    /// 3. Step 2: embed(acoustic_1) via codec_embedding[1] → lm_head[2] → acoustic_2
+    /// 1. Prefill: `[talker_hidden, semantic_embed]` → `lm_head[0]` → acoustic_0
+    /// 2. Step 1: embed(acoustic_0) via `codec_embedding[0]` → `lm_head[1]` → acoustic_1
+    /// 3. Step 2: embed(acoustic_1) via `codec_embedding[1]` → `lm_head[2]` → acoustic_2
     ///
     /// ...and so on for all 15 acoustic tokens.
     ///

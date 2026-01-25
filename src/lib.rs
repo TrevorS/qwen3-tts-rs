@@ -1,29 +1,63 @@
 //! # Qwen3-TTS
 //!
-//! Pure Rust inference for Qwen3-TTS text-to-speech model.
+//! Pure Rust inference for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS),
+//! a high-quality text-to-speech model from Alibaba.
 //!
 //! ## Features
 //!
-//! - **CPU**: Default, with optional MKL/Accelerate for faster BLAS
-//! - **CUDA**: NVIDIA GPU acceleration
-//! - **Metal**: Apple Silicon GPU acceleration
+//! - **CPU inference** with optional MKL/Accelerate for faster BLAS operations
+//! - **CUDA** support for NVIDIA GPU acceleration
+//! - **Metal** support for Apple Silicon
+//! - **Streaming-friendly** architecture with incremental token generation
+//! - **Voice cloning** support via speaker encoder (ECAPA-TDNN)
+//!
+//! ## Quick Start
+//!
+//! ```rust,ignore
+//! use qwen3_tts::{Qwen3TTS, SynthesisOptions, auto_device};
+//!
+//! // Load model (downloads from HuggingFace on first use)
+//! let device = auto_device()?;
+//! let model = Qwen3TTS::from_pretrained("path/to/model", device)?;
+//!
+//! // Synthesize speech with default settings
+//! let audio = model.synthesize("Hello, world!", None)?;
+//! audio.save("output.wav")?;
+//!
+//! // Or with custom options
+//! let options = SynthesisOptions {
+//!     temperature: 0.8,
+//!     top_k: 30,
+//!     ..Default::default()
+//! };
+//! let audio = model.synthesize("Custom settings!", Some(options))?;
+//! ```
 //!
 //! ## Architecture
 //!
-//! The TTS pipeline consists of:
-//! 1. **TalkerModel**: Generates semantic tokens from text autoregressively
-//! 2. **CodePredictor**: Generates acoustic tokens (15) for each semantic token
-//! 3. **Decoder12Hz**: Converts codec tokens to audio waveform
+//! The TTS pipeline consists of three stages:
 //!
-//! ## Example
+//! 1. **TalkerModel**: Transformer that generates semantic tokens from text
+//!    autoregressively. Based on Qwen2 architecture with dual embeddings
+//!    (text + codec) and RoPE position encoding.
 //!
-//! ```rust,ignore
-//! use qwen3_tts::{Qwen3TTS, Config};
+//! 2. **CodePredictor**: For each semantic token, generates 15 acoustic
+//!    tokens using a smaller autoregressive decoder. Uses residual VQ
+//!    pattern where embeddings are summed across codebooks.
 //!
-//! let model = Qwen3TTS::from_pretrained("Qwen/Qwen3-TTS-12Hz-0.6B-Base")?;
-//! let audio = model.synthesize("Hello, world!", None)?;
-//! audio.save("output.wav")?;
-//! ```
+//! 3. **Decoder12Hz**: Converts the 16-codebook codec tokens to audio
+//!    waveform at 24kHz. Uses ConvNeXt blocks and transposed convolutions
+//!    for upsampling.
+//!
+//! ## Model Variants
+//!
+//! - **Base**: General English/Chinese TTS
+//! - **CustomVoice**: Voice cloning with speaker encoder
+//!
+//! ## Sample Rate
+//!
+//! Output audio is always 24kHz mono. Use [`audio::resample()`] if you need
+//! a different sample rate.
 
 pub mod audio;
 pub mod generation;
@@ -354,7 +388,22 @@ impl Default for SynthesisOptions {
     }
 }
 
-/// Select the best available device
+/// Select the best available compute device for inference.
+///
+/// Checks for available hardware in order: CUDA → Metal → CPU.
+/// Falls back to CPU if no GPU acceleration is available.
+///
+/// # Feature Flags
+///
+/// - `cuda`: Enables NVIDIA GPU support
+/// - `metal`: Enables Apple Silicon GPU support
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let device = qwen3_tts::auto_device()?;
+/// let model = Qwen3TTS::from_pretrained("path/to/model", device)?;
+/// ```
 pub fn auto_device() -> Result<Device> {
     #[cfg(feature = "cuda")]
     {

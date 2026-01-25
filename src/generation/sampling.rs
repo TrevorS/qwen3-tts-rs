@@ -93,7 +93,7 @@ impl Default for GenerationConfig {
 /// * `config` - Generation configuration
 ///
 /// # Returns
-/// Token indices of shape [batch]
+/// Token indices of shape `[batch]`
 pub fn sample(logits: &Tensor, config: &GenerationConfig) -> Result<Tensor> {
     let logits = logits.to_dtype(DType::F32)?;
 
