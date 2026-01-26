@@ -1,14 +1,13 @@
-//! Qwen3-TTS main model implementation
+//! Shared transformer building blocks for Qwen3-TTS
 //!
-//! This implements the "Talker" model that generates audio codec tokens
-//! from text input autoregressively.
+//! Contains `KVCache`, `RotaryEmbedding`, `MRoPE`, `Attention`, `MLP`,
+//! and `DecoderLayer` — used by both `TalkerModel` and `CodePredictor`.
 
 use anyhow::Result;
 use candle_core::{Device, IndexOp, Module, Tensor, D};
-use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
+use candle_nn::{linear_no_bias, rms_norm, Linear, RmsNorm, VarBuilder};
 
 use super::config::Qwen3TTSConfig;
-use crate::generation::GenerationConfig;
 
 /// Rotary position embedding (standard RoPE)
 pub struct RotaryEmbedding {
@@ -514,156 +513,6 @@ impl KVCache {
     }
 }
 
-/// Main Qwen3-TTS model
-pub struct Qwen3TTSModel {
-    embed_tokens: Embedding,
-    layers: Vec<DecoderLayer>,
-    norm: RmsNorm,
-    lm_head: Linear,
-    rope: RotaryEmbedding,
-    _config: Qwen3TTSConfig,
-    device: Device,
-}
-
-impl Qwen3TTSModel {
-    /// Load model from pretrained weights
-    pub fn from_pretrained(
-        model_id: &str,
-        _config: &Qwen3TTSConfig,
-        _device: &Device,
-    ) -> Result<Self> {
-        // TODO: Implement weight loading from safetensors
-        // For now, just return uninitialized error
-        anyhow::bail!("Weight loading not yet implemented. Model ID: {}", model_id)
-    }
-
-    /// Create model with given weights
-    pub fn new(config: Qwen3TTSConfig, vb: VarBuilder) -> Result<Self> {
-        let device = vb.device().clone();
-
-        let embed_tokens = embedding(
-            config.vocab_size,
-            config.hidden_size,
-            vb.pp("model.embed_tokens"),
-        )?;
-
-        let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        for i in 0..config.num_hidden_layers {
-            layers.push(DecoderLayer::new(
-                &config,
-                vb.pp(format!("model.layers.{}", i)),
-            )?);
-        }
-
-        let norm = rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("model.norm"))?;
-        let lm_head = linear_no_bias(config.hidden_size, config.vocab_size, vb.pp("lm_head"))?;
-
-        let rope = RotaryEmbedding::new(
-            config.head_dim(),
-            config.max_position_embeddings,
-            config.rope_theta,
-            &device,
-        )?;
-
-        Ok(Self {
-            embed_tokens,
-            layers,
-            norm,
-            lm_head,
-            rope,
-            _config: config,
-            device,
-        })
-    }
-
-    /// Forward pass returning logits
-    pub fn forward(
-        &self,
-        input_ids: &Tensor,
-        kv_caches: &mut [KVCache],
-        offset: usize,
-    ) -> Result<Tensor> {
-        let attention_mask = self.create_causal_mask(input_ids.dim(1)?, offset)?;
-
-        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
-
-        for (i, layer) in self.layers.iter().enumerate() {
-            hidden_states = layer.forward(
-                &hidden_states,
-                &self.rope,
-                Some(&attention_mask),
-                Some(&mut kv_caches[i]),
-                offset,
-            )?;
-        }
-
-        hidden_states = self.norm.forward(&hidden_states)?;
-        let logits = self.lm_head.forward(&hidden_states)?;
-
-        Ok(logits)
-    }
-
-    /// Generate codec tokens autoregressively
-    pub fn generate(
-        &self,
-        input_ids: &Tensor,
-        _speaker_embedding: Option<&Tensor>,
-        config: &GenerationConfig,
-    ) -> Result<Tensor> {
-        let _batch_size = input_ids.dim(0)?;
-        let mut kv_caches: Vec<KVCache> = (0..self.layers.len()).map(|_| KVCache::new()).collect();
-
-        // Process input prompt
-        let mut logits = self.forward(input_ids, &mut kv_caches, 0)?;
-        let mut generated = input_ids.clone();
-        let mut offset = input_ids.dim(1)?;
-
-        // Generate tokens
-        for _ in 0..config.max_new_tokens {
-            // Get last token logits
-            let last_logits = logits.i((.., logits.dim(1)? - 1, ..))?;
-
-            // Sample next token
-            let next_token = crate::generation::sample(&last_logits, config)?;
-
-            // Check for EOS - stop if all sequences in batch have generated EOS
-            if let Some(eos_id) = config.eos_token_id {
-                let token_ids: Vec<u32> = next_token.flatten_all()?.to_vec1()?;
-                if token_ids.iter().all(|&t| t == eos_id) {
-                    break;
-                }
-            }
-
-            // Append to generated sequence
-            let next_token = next_token.unsqueeze(1)?;
-            generated = Tensor::cat(&[&generated, &next_token], 1)?;
-
-            // Forward with just the new token
-            logits = self.forward(&next_token, &mut kv_caches, offset)?;
-            offset += 1;
-        }
-
-        Ok(generated)
-    }
-
-    fn create_causal_mask(&self, seq_len: usize, offset: usize) -> Result<Tensor> {
-        let total_len = offset + seq_len;
-        let mask: Vec<f32> = (0..seq_len)
-            .flat_map(|i| {
-                (0..total_len).map(move |j| {
-                    if j <= offset + i {
-                        0.0
-                    } else {
-                        f32::NEG_INFINITY
-                    }
-                })
-            })
-            .collect();
-
-        Ok(Tensor::new(mask.as_slice(), &self.device)?.reshape((1, 1, seq_len, total_len))?)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -862,89 +711,11 @@ mod tests {
     }
 
     #[test]
-    fn test_qwen3_tts_model_creation() {
-        let device = Device::Cpu;
-        let config = small_config();
-        let vb = create_mock_vb(&device);
-
-        let model = Qwen3TTSModel::new(config.clone(), vb).unwrap();
-
-        assert_eq!(model.layers.len(), 2);
-        assert_eq!(config.hidden_size, 64);
-    }
-
-    #[test]
-    fn test_qwen3_tts_model_construction_only() {
-        let device = Device::Cpu;
-        let config = small_config();
-        let vb = create_mock_vb(&device);
-
-        let model = Qwen3TTSModel::new(config.clone(), vb);
-        // Just verify construction succeeds
-        assert!(model.is_ok());
-    }
-
-    #[test]
     fn test_qwen3_tts_kv_caches_creation() {
         // Test that KV caches can be created for a model
         let kv_caches: Vec<KVCache> = (0..2).map(|_| KVCache::new()).collect();
         // Just verify KV caches can be created
         assert_eq!(kv_caches.len(), 2);
-    }
-
-    #[test]
-    fn test_causal_mask_shape() {
-        let device = Device::Cpu;
-        let config = small_config();
-        let vb = create_mock_vb(&device);
-
-        let model = Qwen3TTSModel::new(config, vb).unwrap();
-
-        let mask = model.create_causal_mask(5, 0).unwrap();
-        assert_eq!(mask.dims(), &[1, 1, 5, 5]);
-    }
-
-    #[test]
-    fn test_causal_mask_values() {
-        let device = Device::Cpu;
-        let config = small_config();
-        let vb = create_mock_vb(&device);
-
-        let model = Qwen3TTSModel::new(config, vb).unwrap();
-
-        let mask = model.create_causal_mask(3, 0).unwrap();
-        let mask_vals: Vec<f32> = mask.flatten_all().unwrap().to_vec1().unwrap();
-
-        // For a 3x3 causal mask:
-        // [0, -inf, -inf]
-        // [0, 0, -inf]
-        // [0, 0, 0]
-        assert_eq!(mask_vals[0], 0.0); // (0,0) - can attend
-        assert!(mask_vals[1] == f32::NEG_INFINITY); // (0,1) - cannot attend
-        assert_eq!(mask_vals[3], 0.0); // (1,0) - can attend
-        assert_eq!(mask_vals[4], 0.0); // (1,1) - can attend
-        assert!(mask_vals[5] == f32::NEG_INFINITY); // (1,2) - cannot attend
-    }
-
-    #[test]
-    fn test_causal_mask_with_offset() {
-        let device = Device::Cpu;
-        let config = small_config();
-        let vb = create_mock_vb(&device);
-
-        let model = Qwen3TTSModel::new(config, vb).unwrap();
-
-        // seq_len=2, offset=3 -> total_len=5
-        let mask = model.create_causal_mask(2, 3).unwrap();
-        assert_eq!(mask.dims(), &[1, 1, 2, 5]);
-    }
-
-    #[test]
-    fn test_from_pretrained_not_implemented() {
-        let device = Device::Cpu;
-        let config = small_config();
-        let result = Qwen3TTSModel::from_pretrained("/some/path", &config, &device);
-        assert!(result.is_err());
     }
 
     #[test]

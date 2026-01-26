@@ -1020,7 +1020,7 @@ fn test_model_module_matches_reference() -> Result<()> {
     // This test uses the actual qwen3_tts model module to verify it matches Python
     use candle_nn::VarBuilder;
     use qwen3_tts::models::config::Qwen3TTSConfig;
-    use qwen3_tts::models::qwen3_tts::{DecoderLayer, RotaryEmbedding};
+    use qwen3_tts::models::transformer::{DecoderLayer, RotaryEmbedding};
 
     if !reference_available() {
         return Ok(());
@@ -1333,8 +1333,8 @@ fn test_code_predictor_module() -> Result<()> {
     let talker_hidden = cp_input.narrow(1, 0, 1)?; // [1, 1, 1024]
 
     // Run prefill with just talker hidden
-    let mut kv_caches: Vec<qwen3_tts::models::qwen3_tts::KVCache> = (0..config.num_hidden_layers)
-        .map(|_| qwen3_tts::models::qwen3_tts::KVCache::new())
+    let mut kv_caches: Vec<qwen3_tts::models::transformer::KVCache> = (0..config.num_hidden_layers)
+        .map(|_| qwen3_tts::models::transformer::KVCache::new())
         .collect();
 
     let hidden = predictor.forward_prefill(&talker_hidden, &[], &mut kv_caches)?;

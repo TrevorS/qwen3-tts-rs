@@ -82,7 +82,6 @@ pub use hub::ModelPaths;
 pub use models::config::Qwen3TTSConfig;
 // StreamingSession is defined in this module, exported as top-level type
 pub use models::talker::{codec_tokens, special_tokens, tts_tokens, Language, Speaker};
-pub use models::Qwen3TTSModel;
 pub use models::{CodePredictor, CodePredictorConfig, TalkerConfig, TalkerModel as Talker};
 
 /// Main TTS interface using proper autoregressive pipeline
@@ -232,44 +231,18 @@ impl Qwen3TTS {
         })
     }
 
-    /// Synthesize speech from text using proper autoregressive pipeline
+    /// Synthesize speech from text with default voice (Ryan, English).
     ///
-    /// Pipeline:
-    /// 1. Tokenize text
-    /// 2. Prefill TalkerModel with text tokens
-    /// 3. Autoregressively generate semantic tokens
-    /// 4. For each semantic token, generate 15 acoustic tokens via CodePredictor
-    /// 5. Decode accumulated codes to audio via Decoder12Hz
+    /// Convenience wrapper around [`synthesize_with_voice`](Self::synthesize_with_voice).
     pub fn synthesize(&self, text: &str, options: Option<SynthesisOptions>) -> Result<AudioBuffer> {
-        let options = options.unwrap_or_default();
-
-        // Tokenize text
-        let input_ids = self.text_tokenizer.encode(text)?;
-        let input_tensor = Tensor::new(input_ids.as_slice(), &self.device)?.unsqueeze(0)?;
-
-        // Generate codes using proper pipeline
-        let codes = self.generate_codes(
-            &input_tensor,
-            &generation::GenerationConfig {
-                max_new_tokens: options.max_length,
-                temperature: options.temperature,
-                top_k: options.top_k,
-                top_p: options.top_p,
-                repetition_penalty: options.repetition_penalty,
-                eos_token_id: options.eos_token_id,
-            },
-        )?;
-
-        // Decode to audio
-        let waveform = self.decoder.decode(&codes)?;
-
-        AudioBuffer::from_tensor(waveform, 24000)
+        self.synthesize_with_voice(text, Speaker::Ryan, Language::English, options)
     }
 
     /// Synthesize speech with a specific voice and language.
     ///
-    /// Uses the CustomVoice pipeline with predefined speaker embeddings.
-    /// Requires a CustomVoice model (not the base model).
+    /// Uses the correct generation loop: CustomVoice prefill, autoregressive
+    /// semantic tokens, per-frame acoustic code prediction via CodePredictor,
+    /// residual VQ summation, and trailing text fusion.
     ///
     /// # Arguments
     ///
@@ -299,12 +272,9 @@ impl Qwen3TTS {
         options: Option<SynthesisOptions>,
     ) -> Result<AudioBuffer> {
         let options = options.unwrap_or_default();
-
-        // Tokenize text
         let input_ids = self.text_tokenizer.encode(text)?;
 
-        // Generate semantic tokens using CustomVoice pipeline
-        let config = generation::GenerationConfig {
+        let gen_config = generation::GenerationConfig {
             max_new_tokens: options.max_length,
             temperature: options.temperature,
             top_k: options.top_k,
@@ -313,141 +283,89 @@ impl Qwen3TTS {
             eos_token_id: options.eos_token_id,
         };
 
-        let semantic_tokens = self
-            .talker
-            .generate_custom_voice(&input_ids, speaker, language, &config)?;
+        // Build trailing text: remaining text tokens projected + tts_eos.
+        // After trailing text is exhausted, tts_pad is used for each subsequent step.
+        let trailing_text_hidden = if input_ids.len() > 1 {
+            let remaining_proj = self.talker.get_projected_text_embeddings(&input_ids[1..])?;
+            let tts_eos_embed = self.talker.get_tts_eos_embed()?;
+            Tensor::cat(&[&remaining_proj, &tts_eos_embed], 1)?
+        } else {
+            self.talker.get_tts_eos_embed()?
+        };
+        let trailing_text_len = trailing_text_hidden.dim(1)?;
+        let tts_pad_embed = self.talker.get_tts_pad_embed()?;
 
-        // Generate full 16-codebook codes for each semantic token
-        let mut all_codes: Vec<Vec<u32>> = Vec::new();
-
-        // We need hidden states for the code predictor, so we'll use prefill
+        // Prefill with CustomVoice format
         let mut kv_caches = self.talker.new_kv_caches();
-        let (hidden, _) =
+        let (hidden, logits) =
             self.talker
                 .prefill_custom_voice(&input_ids, speaker, language, &mut kv_caches)?;
-        let seq_len = hidden.dim(1)?;
-        let mut last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
+        let prefill_len = hidden.dim(1)?;
+        let mut offset = prefill_len;
+        let mut last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
 
-        for (i, &semantic_token) in semantic_tokens.iter().enumerate() {
-            // Get codec embedding for this semantic token
-            let semantic_embed = self.talker.get_codec_embedding(semantic_token)?;
+        // Sample first semantic token (with token suppression)
+        let logits_suppressed =
+            generation::apply_token_suppression(&logits.squeeze(1)?, 3072, 151670)?;
+        let first_token = generation::sample(&logits_suppressed, &gen_config)?;
+        let mut semantic_token: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
 
-            // Generate 15 acoustic tokens
-            let acoustic_codes = self
-                .code_predictor
-                .generate_acoustic_codes(&last_hidden, &semantic_embed)?;
-
-            let mut frame_codes = vec![semantic_token];
-            frame_codes.extend(acoustic_codes);
-            all_codes.push(frame_codes);
-
-            // Update hidden state for next iteration (if not last)
-            if i < semantic_tokens.len() - 1 {
-                let offset = seq_len + i;
-                let (hidden, _) =
-                    self.talker
-                        .generate_step(semantic_token, &mut kv_caches, offset)?;
-                last_hidden = hidden;
-            }
-        }
-
-        // Convert to tensor and decode
-        let codes = self.codes_to_tensor(&all_codes)?;
-        let waveform = self.decoder.decode(&codes)?;
-
-        AudioBuffer::from_tensor(waveform, 24000)
-    }
-
-    /// Generate codec tokens using proper autoregressive pipeline
-    ///
-    /// Returns tensor of shape [batch, 16, num_frames]
-    pub fn generate_codes(
-        &self,
-        input_ids: &Tensor,
-        config: &generation::GenerationConfig,
-    ) -> Result<Tensor> {
-        let mut talker_kv_caches: Vec<KVCache> = self.talker.new_kv_caches();
-
-        // Prefill talker with text
-        let (hidden, logits) = self.talker.prefill(input_ids, &mut talker_kv_caches)?;
-        let mut offset = input_ids.dim(1)?;
-
-        // Get hidden state for last position (input to code predictor)
-        let seq_len = hidden.dim(1)?;
-        let mut last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
-
-        // Apply token suppression: suppress tokens 2048-3071 (except EOS)
-        // vocab_size=3072, codebook_size=2048
-        let logits_suppressed = generation::apply_token_suppression(
-            &logits.squeeze(1)?,
-            3072,
-            config.eos_token_id.unwrap_or(AUDIO_EOS_TOKEN_ID),
-        )?;
-
-        // Sample first semantic token
-        let first_token = generation::sample(&logits_suppressed, config)?;
-        let first_token_id: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
-
-        // Check for EOS
-        if let Some(eos_id) = config.eos_token_id {
-            if first_token_id == eos_id {
-                // Return empty codes
-                return Ok(Tensor::zeros((1, 16, 0), DType::I64, &self.device)?);
-            }
-        }
-
-        // Collect all frames: Vec<[semantic, acoustic_0..14]>
         let mut all_codes: Vec<Vec<u32>> = Vec::new();
 
-        // Generate first frame's acoustic tokens
-        let semantic_embed = self.talker.get_codec_embedding(first_token_id)?;
-        let acoustic_codes = self
-            .code_predictor
-            .generate_acoustic_codes(&last_hidden, &semantic_embed)?;
-        let mut frame_codes = vec![first_token_id];
-        frame_codes.extend(acoustic_codes);
-        all_codes.push(frame_codes);
-
-        // Generate remaining frames
-        for _ in 1..config.max_new_tokens {
-            // Generate next semantic token
-            let prev_token = all_codes.last().unwrap()[0];
-            let (hidden, logits) =
-                self.talker
-                    .generate_step(prev_token, &mut talker_kv_caches, offset)?;
-            offset += 1;
-            last_hidden = hidden;
-
-            // Apply token suppression before sampling
-            let logits_suppressed = generation::apply_token_suppression(
-                &logits.squeeze(1)?,
-                3072,
-                config.eos_token_id.unwrap_or(AUDIO_EOS_TOKEN_ID),
-            )?;
-
-            // Sample semantic token
-            let next_token = generation::sample(&logits_suppressed, config)?;
-            let next_token_id: u32 = next_token.flatten_all()?.to_vec1::<u32>()?[0];
-
-            // Check for EOS
-            if let Some(eos_id) = config.eos_token_id {
-                if next_token_id == eos_id {
+        // Generation loop: semantic token → acoustic codes → residual VQ sum → trailing text → next step
+        for frame_idx in 0..gen_config.max_new_tokens {
+            // Check EOS
+            if let Some(eos_id) = gen_config.eos_token_id {
+                if semantic_token == eos_id {
                     break;
                 }
             }
 
-            // Generate acoustic tokens for this frame
-            let semantic_embed = self.talker.get_codec_embedding(next_token_id)?;
+            let semantic_embed = self.talker.get_codec_embedding(semantic_token)?;
+
+            // Generate 15 acoustic codes autoregressively
             let acoustic_codes = self
                 .code_predictor
                 .generate_acoustic_codes(&last_hidden, &semantic_embed)?;
-            let mut frame_codes = vec![next_token_id];
-            frame_codes.extend(acoustic_codes);
+
+            // Save frame [semantic, acoustic_0..14]
+            let mut frame_codes = vec![semantic_token];
+            frame_codes.extend(&acoustic_codes);
             all_codes.push(frame_codes);
+
+            // Build input for next talker step:
+            // sum all 16 code embeddings (residual VQ pattern)
+            let acoustic_embed_sum = self
+                .code_predictor
+                .get_acoustic_embeddings_sum(&acoustic_codes, &self.device)?;
+            let summed = semantic_embed.add(&acoustic_embed_sum)?;
+
+            // Add trailing text embedding (or tts_pad if exhausted)
+            let text_addition = if frame_idx < trailing_text_len {
+                trailing_text_hidden.i((.., frame_idx..frame_idx + 1, ..))?
+            } else {
+                tts_pad_embed.clone()
+            };
+            let step_input = summed.add(&text_addition)?;
+
+            // Run through talker to get next hidden state and logits
+            let (h, new_logits) =
+                self.talker
+                    .generate_step_with_embed(&step_input, &mut kv_caches, offset)?;
+            offset += 1;
+            last_hidden = h;
+
+            // Sample next semantic token
+            let logits_suppressed =
+                generation::apply_token_suppression(&new_logits.squeeze(1)?, 3072, 151670)?;
+            let next_token = generation::sample(&logits_suppressed, &gen_config)?;
+            semantic_token = next_token.flatten_all()?.to_vec1::<u32>()?[0];
         }
 
-        // Convert to tensor [1, 16, num_frames]
-        self.codes_to_tensor(&all_codes)
+        // Decode to audio
+        let codes = self.codes_to_tensor(&all_codes)?;
+        let waveform = self.decoder.decode(&codes)?;
+        AudioBuffer::from_tensor(waveform, 24000)
     }
 
     /// Convert list of frame codes to tensor [batch, 16, num_frames]
@@ -473,7 +391,7 @@ impl Qwen3TTS {
         &self.device
     }
 
-    /// Create a streaming synthesis session.
+    /// Create a streaming synthesis session with a specific voice and language.
     ///
     /// Returns an iterator that yields audio chunks as they are generated.
     /// Each chunk contains approximately `chunk_frames` frames worth of audio
@@ -482,8 +400,10 @@ impl Qwen3TTS {
     /// # Example
     ///
     /// ```rust,ignore
+    /// use qwen3_tts::{Qwen3TTS, Speaker, Language, SynthesisOptions};
+    ///
     /// let options = SynthesisOptions::default();
-    /// for chunk in model.synthesize_streaming("Hello, world!", options)? {
+    /// for chunk in model.synthesize_streaming("Hello!", Speaker::Ryan, Language::English, options)? {
     ///     let audio = chunk?;
     ///     // Play or process audio chunk (each ~800ms)
     /// }
@@ -491,13 +411,12 @@ impl Qwen3TTS {
     pub fn synthesize_streaming(
         &self,
         text: &str,
+        speaker: Speaker,
+        language: Language,
         options: SynthesisOptions,
     ) -> Result<StreamingSession<'_>> {
-        // Tokenize text
         let input_ids = self.text_tokenizer.encode(text)?;
-        let input_tensor = Tensor::new(input_ids.as_slice(), &self.device)?.unsqueeze(0)?;
-
-        StreamingSession::new(self, input_tensor, options)
+        StreamingSession::new(self, &input_ids, speaker, language, options)
     }
 
     /// Load weights from safetensors file
@@ -541,7 +460,8 @@ pub const SAMPLES_PER_FRAME: usize = 1920;
 
 /// Streaming synthesis session.
 ///
-/// Yields audio chunks as they are generated. Use with `synthesize_streaming`.
+/// Yields audio chunks as they are generated. Use with
+/// [`Qwen3TTS::synthesize_streaming`].
 pub struct StreamingSession<'a> {
     model: &'a Qwen3TTS,
     config: generation::GenerationConfig,
@@ -553,10 +473,20 @@ pub struct StreamingSession<'a> {
     frame_buffer: Vec<Vec<u32>>,
     chunk_frames: usize,
     done: bool,
+    // Trailing text state for residual VQ + text fusion
+    trailing_text_hidden: Tensor,
+    trailing_text_len: usize,
+    tts_pad_embed: Tensor,
 }
 
 impl<'a> StreamingSession<'a> {
-    fn new(model: &'a Qwen3TTS, input_ids: Tensor, options: SynthesisOptions) -> Result<Self> {
+    fn new(
+        model: &'a Qwen3TTS,
+        input_ids: &[u32],
+        speaker: Speaker,
+        language: Language,
+        options: SynthesisOptions,
+    ) -> Result<Self> {
         let config = generation::GenerationConfig {
             max_new_tokens: options.max_length,
             temperature: options.temperature,
@@ -566,39 +496,50 @@ impl<'a> StreamingSession<'a> {
             eos_token_id: options.eos_token_id,
         };
 
+        // Build trailing text embeddings
+        let trailing_text_hidden = if input_ids.len() > 1 {
+            let remaining_proj = model
+                .talker
+                .get_projected_text_embeddings(&input_ids[1..])?;
+            let tts_eos_embed = model.talker.get_tts_eos_embed()?;
+            Tensor::cat(&[&remaining_proj, &tts_eos_embed], 1)?
+        } else {
+            model.talker.get_tts_eos_embed()?
+        };
+        let trailing_text_len = trailing_text_hidden.dim(1)?;
+        let tts_pad_embed = model.talker.get_tts_pad_embed()?;
+
+        // Prefill with CustomVoice format
         let mut kv_caches = model.talker.new_kv_caches();
+        let (hidden, logits) =
+            model
+                .talker
+                .prefill_custom_voice(input_ids, speaker, language, &mut kv_caches)?;
+        let prefill_len = hidden.dim(1)?;
+        let last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
 
-        // Prefill with text
-        let (hidden, logits) = model.talker.prefill(&input_ids, &mut kv_caches)?;
-        let offset = input_ids.dim(1)?;
-
-        // Get last hidden state
-        let seq_len = hidden.dim(1)?;
-        let last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
-
-        // Apply token suppression and sample first token
-        let logits_suppressed = generation::apply_token_suppression(
-            &logits.squeeze(1)?,
-            3072,
-            config.eos_token_id.unwrap_or(AUDIO_EOS_TOKEN_ID),
-        )?;
+        // Sample first token with token suppression
+        let logits_suppressed =
+            generation::apply_token_suppression(&logits.squeeze(1)?, 3072, 151670)?;
         let first_token = generation::sample(&logits_suppressed, &config)?;
         let first_token_id: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
 
-        // Check for immediate EOS
         let done = config.eos_token_id == Some(first_token_id);
 
         Ok(Self {
             model,
             config,
             kv_caches,
-            offset,
+            offset: prefill_len,
             last_hidden,
             current_token: if done { None } else { Some(first_token_id) },
             frames_generated: 0,
             frame_buffer: Vec::new(),
             chunk_frames: options.chunk_frames,
             done,
+            trailing_text_hidden,
+            trailing_text_len,
+            tts_pad_embed,
         })
     }
 
@@ -629,36 +570,51 @@ impl<'a> StreamingSession<'a> {
                 }
             };
 
-            // Generate acoustic codes for this frame
             let semantic_embed = self.model.talker.get_codec_embedding(token_id)?;
+
+            // Generate 15 acoustic codes
             let acoustic_codes = self
                 .model
                 .code_predictor
                 .generate_acoustic_codes(&self.last_hidden, &semantic_embed)?;
 
             let mut frame_codes = vec![token_id];
-            frame_codes.extend(acoustic_codes);
+            frame_codes.extend(&acoustic_codes);
             self.frame_buffer.push(frame_codes);
+
+            let frame_idx = self.frames_generated;
             self.frames_generated += 1;
 
-            // Generate next token
-            let (hidden, logits) =
-                self.model
-                    .talker
-                    .generate_step(token_id, &mut self.kv_caches, self.offset)?;
-            self.offset += 1;
-            self.last_hidden = hidden;
+            // Build residual VQ sum + trailing text for next step
+            let acoustic_embed_sum = self
+                .model
+                .code_predictor
+                .get_acoustic_embeddings_sum(&acoustic_codes, &self.model.device)?;
+            let summed = semantic_embed.add(&acoustic_embed_sum)?;
 
-            // Apply token suppression before sampling
-            let logits_suppressed = generation::apply_token_suppression(
-                &logits.squeeze(1)?,
-                3072,
-                self.config.eos_token_id.unwrap_or(AUDIO_EOS_TOKEN_ID),
+            let text_addition = if frame_idx < self.trailing_text_len {
+                self.trailing_text_hidden
+                    .i((.., frame_idx..frame_idx + 1, ..))?
+            } else {
+                self.tts_pad_embed.clone()
+            };
+            let step_input = summed.add(&text_addition)?;
+
+            // Run talker step with fused embedding
+            let (h, new_logits) = self.model.talker.generate_step_with_embed(
+                &step_input,
+                &mut self.kv_caches,
+                self.offset,
             )?;
+            self.offset += 1;
+            self.last_hidden = h;
+
+            // Sample next semantic token
+            let logits_suppressed =
+                generation::apply_token_suppression(&new_logits.squeeze(1)?, 3072, 151670)?;
             let next_token = generation::sample(&logits_suppressed, &self.config)?;
             let next_token_id: u32 = next_token.flatten_all()?.to_vec1::<u32>()?[0];
 
-            // Check for EOS
             if self.config.eos_token_id == Some(next_token_id) {
                 self.current_token = None;
                 self.done = true;
@@ -704,7 +660,7 @@ impl<'a> Iterator for StreamingSession<'a> {
 /// Options for speech synthesis
 #[derive(Debug, Clone)]
 pub struct SynthesisOptions {
-    /// Maximum number of tokens to generate
+    /// Maximum number of frames to generate
     pub max_length: usize,
     /// Sampling temperature (higher = more random)
     pub temperature: f64,
@@ -714,10 +670,6 @@ pub struct SynthesisOptions {
     pub top_p: f64,
     /// Repetition penalty
     pub repetition_penalty: f64,
-    /// Optional speaker embedding for voice cloning
-    pub speaker_embedding: Option<Tensor>,
-    /// Language code (e.g., "en", "zh")
-    pub language: Option<String>,
     /// End-of-sequence token ID (defaults to audio_end token 151670)
     pub eos_token_id: Option<u32>,
     /// Frames per streaming chunk (default: 10 = ~800ms)
@@ -732,8 +684,6 @@ impl Default for SynthesisOptions {
             top_k: 50,
             top_p: 0.9,
             repetition_penalty: 1.0,
-            speaker_embedding: None,
-            language: None,
             eos_token_id: Some(AUDIO_EOS_TOKEN_ID),
             chunk_frames: 10, // ~800ms per chunk at 12.5 Hz
         }
@@ -791,8 +741,6 @@ mod tests {
         assert_eq!(options.top_k, 50);
         assert!((options.top_p - 0.9).abs() < 1e-6);
         assert!((options.repetition_penalty - 1.0).abs() < 1e-6);
-        assert!(options.speaker_embedding.is_none());
-        assert!(options.language.is_none());
         assert_eq!(options.eos_token_id, Some(AUDIO_EOS_TOKEN_ID));
         assert_eq!(options.chunk_frames, 10);
     }
@@ -805,14 +753,11 @@ mod tests {
             top_k: 10,
             top_p: 0.8,
             repetition_penalty: 1.2,
-            speaker_embedding: None,
-            language: Some("en".to_string()),
             eos_token_id: Some(AUDIO_EOS_TOKEN_ID),
             chunk_frames: 5,
         };
         assert_eq!(options.max_length, 512);
         assert!((options.temperature - 0.5).abs() < 1e-6);
-        assert_eq!(options.language, Some("en".to_string()));
         assert_eq!(options.eos_token_id, Some(151670));
         assert_eq!(options.chunk_frames, 5);
     }

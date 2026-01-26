@@ -142,7 +142,7 @@ mod model_tests {
     use super::*;
     use qwen3_tts::models::{
         codec::{presets, CodecDecoder, DecoderConfig},
-        Qwen3TTSConfig, Qwen3TTSModel,
+        Qwen3TTSConfig,
     };
 
     fn small_config() -> Qwen3TTSConfig {
@@ -161,22 +161,10 @@ mod model_tests {
     }
 
     #[test]
-    fn test_model_construction() {
-        // Test that model construction succeeds with mock weights
-        // Forward pass not tested due to mock weight limitations
-        let device = Device::Cpu;
-        let config = small_config();
-        let vb = create_mock_vb(&device);
-
-        let model = Qwen3TTSModel::new(config.clone(), vb);
-        assert!(model.is_ok());
-    }
-
-    #[test]
     fn test_kv_cache_creation() {
         let config = small_config();
-        let kv_caches: Vec<qwen3_tts::models::qwen3_tts::KVCache> = (0..config.num_hidden_layers)
-            .map(|_| qwen3_tts::models::qwen3_tts::KVCache::new())
+        let kv_caches: Vec<qwen3_tts::models::transformer::KVCache> = (0..config.num_hidden_layers)
+            .map(|_| qwen3_tts::models::transformer::KVCache::new())
             .collect();
 
         assert_eq!(kv_caches.len(), config.num_hidden_layers);
@@ -271,8 +259,6 @@ mod end_to_end_mock {
             top_k: 30,
             top_p: 0.85,
             repetition_penalty: 1.1,
-            speaker_embedding: None,
-            language: Some("en".to_string()),
             eos_token_id: Some(151670), // audio_end token
             chunk_frames: 10,
         };

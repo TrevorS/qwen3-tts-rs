@@ -13,7 +13,7 @@ use candle_core::{IndexOp, Module, Tensor, D};
 use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
 
 use super::config::Qwen3TTSConfig;
-use super::qwen3_tts::{DecoderLayer, KVCache, RotaryEmbedding};
+use super::transformer::{DecoderLayer, KVCache, RotaryEmbedding};
 
 /// Code predictor configuration
 #[derive(Debug, Clone)]

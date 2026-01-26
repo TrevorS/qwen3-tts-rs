@@ -63,16 +63,6 @@ name = "generate_audio"
 path = "src/bin/generate_audio.rs"
 required-features = ["cli"]
 
-[[bin]]
-name = "tts_generate"
-path = "src/bin/tts_generate.rs"
-required-features = ["cli"]
-
-[[bin]]
-name = "custom_voice_tts"
-path = "src/bin/custom_voice_tts.rs"
-required-features = ["cli"]
-
 [profile.release]
 lto = true
 codegen-units = 1

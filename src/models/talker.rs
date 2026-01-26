@@ -20,7 +20,7 @@ use anyhow::Result;
 use candle_core::{Device, IndexOp, Tensor, D};
 use std::collections::HashMap;
 
-use super::qwen3_tts::{KVCache, MRoPE, RotaryEmbedding};
+use super::transformer::{KVCache, MRoPE, RotaryEmbedding};
 use crate::generation::GenerationConfig;
 
 /// ChatML special token IDs

@@ -15,7 +15,4 @@ pub use sampling::{
     set_seed, GenerationConfig,
 };
 
-pub use tts::{
-    apply_token_suppression, build_prefill_embeddings, sum_residual_embeddings,
-    TtsGenerationConfig, TtsTokenIds,
-};
+pub use tts::apply_token_suppression;
