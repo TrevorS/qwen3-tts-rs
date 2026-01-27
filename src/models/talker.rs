@@ -631,33 +631,27 @@ impl TalkerModel {
 
     /// Build ICL (in-context learning) prompt for voice cloning.
     ///
-    /// Uses **streaming mode** (the official Python default, `non_streaming_mode=False`):
-    /// text and codec embeddings are aligned element-wise. If one is shorter, it
-    /// is padded with the appropriate fill embedding.
+    /// Supports two modes controlled by `non_streaming`:
     ///
-    /// **Note:** ICL voice cloning requires GPU (bfloat16 / flash attention) to
-    /// produce intelligible speech. On CPU with float32, both the official Python
-    /// and this Rust implementation produce unintelligible output. The x_vector_only
-    /// mode works correctly on CPU.
+    /// **Streaming** (`non_streaming=false`, official Python default):
+    /// Text and codec embeddings are aligned element-wise. If one is shorter,
+    /// it is padded. Remaining text tokens become trailing context fed during
+    /// generation.
     ///
-    /// # Algorithm
-    ///
-    /// 1. Text side: `text_proj(text_embed([ref_text, target_text, tts_eos]))`
-    /// 2. Codec side: `[codec_bos, ref_frame_0, ref_frame_1, ...]` (pre-summed across groups)
-    /// 3. Streaming overlay (element-wise):
-    ///    - If `N_text > N_codec`: `icl = text[:N_codec] + codec`, trailing = `text[N_codec:]`
-    ///    - If `N_codec >= N_text`: pad text with `tts_pad` to N_codec, `icl = padded_text + codec`,
-    ///      trailing = `tts_pad`
+    /// **Non-streaming** (`non_streaming=true`, used by mlx-audio):
+    /// Text and codec are kept as separate sequential blocks:
+    /// `[text + codec_pad_embed || codec + tts_pad_embed]`. All text is consumed
+    /// in the prefix, so trailing is just `tts_pad`. This gives the model complete
+    /// context before generation starts.
     ///
     /// # Returns
-    /// `(icl_embed, trailing_text_embed)` where:
-    /// - `icl_embed`: `[1, max(N_text, N_codec), hidden]` — ICL context
-    /// - `trailing_text_embed`: remaining text or `tts_pad`
+    /// `(icl_embed, trailing_text_embed)`
     pub fn build_icl_prompt(
         &self,
         target_text_ids: &[u32],
         ref_text_ids: &[u32],
         ref_codec_embeds: &Tensor, // [1, T_ref, hidden]
+        non_streaming: bool,
     ) -> Result<(Tensor, Tensor)> {
         use codec_tokens::*;
         use tts_tokens::*;
@@ -678,27 +672,43 @@ impl TalkerModel {
         let codec_embed = Tensor::cat(&[&bos_embed, ref_codec_embeds], 1)?; // [1, T_ref+1, hidden]
         let n_codec = codec_embed.dim(1)?;
 
-        // --- 3. Streaming overlay (element-wise, matching official Python default) ---
         let tts_pad_embed = self.get_tts_pad_embed()?; // [1, 1, hidden]
 
-        if n_text > n_codec {
-            // Text is longer: align text[:n_codec] + codec, trailing = text[n_codec:]
-            let text_head = text_embed.i((.., ..n_codec, ..))?;
-            let icl_embed = text_head.add(&codec_embed)?;
-            let trailing = text_embed.i((.., n_codec.., ..))?;
-            Ok((icl_embed, trailing))
-        } else {
-            // Codec is longer (or equal): pad text with tts_pad, then element-wise add
-            let pad_count = n_codec - n_text;
-            let padded_text = if pad_count > 0 {
-                let pad_broadcast =
-                    tts_pad_embed.broadcast_as((1, pad_count, self.config.hidden_size))?;
-                Tensor::cat(&[&text_embed, &pad_broadcast], 1)?
-            } else {
-                text_embed
-            };
-            let icl_embed = padded_text.add(&codec_embed)?;
+        if non_streaming {
+            // --- 3a. Non-streaming: sequential [text+codec_pad, codec+tts_pad] ---
+            // Each text position gets codec_pad overlay
+            let codec_pad_id = Tensor::new(&[CODEC_PAD], &self.device)?;
+            let codec_pad_embed = self.codec_embedding.forward(&codec_pad_id)?.unsqueeze(0)?;
+            let codec_pad_broadcast =
+                codec_pad_embed.broadcast_as((1, n_text, self.config.hidden_size))?;
+            let text_with_codec_pad = text_embed.add(&codec_pad_broadcast)?;
+
+            // Each codec position gets tts_pad overlay
+            let tts_pad_broadcast =
+                tts_pad_embed.broadcast_as((1, n_codec, self.config.hidden_size))?;
+            let codec_with_tts_pad = codec_embed.add(&tts_pad_broadcast)?;
+
+            let icl_embed = Tensor::cat(&[&text_with_codec_pad, &codec_with_tts_pad], 1)?;
             Ok((icl_embed, tts_pad_embed))
+        } else {
+            // --- 3b. Streaming: element-wise overlay ---
+            if n_text > n_codec {
+                let text_head = text_embed.i((.., ..n_codec, ..))?;
+                let icl_embed = text_head.add(&codec_embed)?;
+                let trailing = text_embed.i((.., n_codec.., ..))?;
+                Ok((icl_embed, trailing))
+            } else {
+                let pad_count = n_codec - n_text;
+                let padded_text = if pad_count > 0 {
+                    let pad_broadcast =
+                        tts_pad_embed.broadcast_as((1, pad_count, self.config.hidden_size))?;
+                    Tensor::cat(&[&text_embed, &pad_broadcast], 1)?
+                } else {
+                    text_embed
+                };
+                let icl_embed = padded_text.add(&codec_embed)?;
+                Ok((icl_embed, tts_pad_embed))
+            }
         }
     }
 

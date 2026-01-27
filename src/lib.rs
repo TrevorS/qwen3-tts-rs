@@ -598,12 +598,23 @@ impl Qwen3TTS {
         // Determine if ICL mode is active (ref_codes + ref_text present)
         let is_icl = prompt.ref_codes.is_some() && prompt.ref_text_ids.is_some();
 
+        // ICL mode adjustments (matching mlx-audio):
+        let repetition_penalty = if is_icl {
+            options.repetition_penalty.max(1.5)
+        } else {
+            options.repetition_penalty
+        };
+        let max_new_tokens = if is_icl {
+            options.max_length.min(75.max(input_ids.len() * 6))
+        } else {
+            options.max_length
+        };
         let gen_config = generation::GenerationConfig {
-            max_new_tokens: options.max_length,
+            max_new_tokens,
             temperature: options.temperature,
             top_k: options.top_k,
             top_p: options.top_p,
-            repetition_penalty: options.repetition_penalty,
+            repetition_penalty,
             eos_token_id: options.eos_token_id,
             min_new_tokens: options.min_new_tokens,
         };
@@ -635,7 +646,7 @@ impl Qwen3TTS {
             // so only the remaining tokens go to trailing_text.
             let (icl_embed, icl_trailing) =
                 self.talker
-                    .build_icl_prompt(&input_ids, ref_text_ids, &ref_codec_embeds)?;
+                    .build_icl_prompt(&input_ids, ref_text_ids, &ref_codec_embeds, false)?;
 
             let icl_len = icl_embed.dim(1)?;
             if icl_len > 0 {
@@ -879,12 +890,25 @@ impl Qwen3TTS {
         // Determine if ICL mode is active (ref_codes + ref_text present)
         let is_icl = prompt.ref_codes.is_some() && prompt.ref_text_ids.is_some();
 
+        // ICL mode adjustments (matching mlx-audio):
+        // - Stronger repetition penalty (min 1.5) to prevent degenerate loops
+        // - Cap max tokens proportional to text length to prevent runaway generation
+        let repetition_penalty = if is_icl {
+            options.repetition_penalty.max(1.5)
+        } else {
+            options.repetition_penalty
+        };
+        let max_new_tokens = if is_icl {
+            options.max_length.min(75.max(input_ids.len() * 6))
+        } else {
+            options.max_length
+        };
         let gen_config = generation::GenerationConfig {
-            max_new_tokens: options.max_length,
+            max_new_tokens,
             temperature: options.temperature,
             top_k: options.top_k,
             top_p: options.top_p,
-            repetition_penalty: options.repetition_penalty,
+            repetition_penalty,
             eos_token_id: options.eos_token_id,
             min_new_tokens: options.min_new_tokens,
         };
@@ -917,7 +941,7 @@ impl Qwen3TTS {
             // text_id=input_id[:, 3:-5] passes ALL target text tokens).
             let (icl_embed, icl_trailing) =
                 self.talker
-                    .build_icl_prompt(&input_ids, ref_text_ids, &ref_codec_embeds)?;
+                    .build_icl_prompt(&input_ids, ref_text_ids, &ref_codec_embeds, false)?;
 
             // Feed ICL embeddings through the model to extend the KV cache.
             // Process in a single pass (no generation, just context extension).
