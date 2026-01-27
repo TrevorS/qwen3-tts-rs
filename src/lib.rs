@@ -595,6 +595,9 @@ impl Qwen3TTS {
         let options = options.unwrap_or_default();
         let input_ids = self.text_tokenizer.encode(text)?;
 
+        // Determine if ICL mode is active (ref_codes + ref_text present)
+        let is_icl = prompt.ref_codes.is_some() && prompt.ref_text_ids.is_some();
+
         let gen_config = generation::GenerationConfig {
             max_new_tokens: options.max_length,
             temperature: options.temperature,
@@ -605,16 +608,20 @@ impl Qwen3TTS {
             min_new_tokens: options.min_new_tokens,
         };
 
-        // Voice clone prefill
+        // Voice clone prefill (9 positions for ICL, 10 for x_vector_only)
         let mut kv_caches = self.talker.new_kv_caches();
         let (hidden, logits) = self.talker.prefill_voice_clone(
             &input_ids,
             &prompt.speaker_embedding,
             language,
+            is_icl,
             &mut kv_caches,
         )?;
         let prefill_len = hidden.dim(1)?;
         let mut offset = prefill_len;
+
+        // Initialize last_hidden from prefill; updated by ICL block if active.
+        let mut last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
 
         // ICL extension (if reference codes + text are provided)
         let (trailing_text_hidden, logits) = if let (Some(ref_codes), Some(ref_text_ids)) =
@@ -622,14 +629,13 @@ impl Qwen3TTS {
         {
             let ref_codec_embeds = self.sum_ref_codec_embeddings(ref_codes)?;
 
-            let target_text = if input_ids.len() > 1 {
-                &input_ids[1..]
-            } else {
-                &[]
-            };
+            // In ICL mode, all text tokens go into the ICL prompt (Python:
+            // text_id=input_id[:, 3:-5] passes ALL target text tokens).
+            // In the non-ICL path the first text token is consumed by the prefill,
+            // so only the remaining tokens go to trailing_text.
             let (icl_embed, icl_trailing) =
                 self.talker
-                    .build_icl_prompt(target_text, ref_text_ids, &ref_codec_embeds)?;
+                    .build_icl_prompt(&input_ids, ref_text_ids, &ref_codec_embeds)?;
 
             let icl_len = icl_embed.dim(1)?;
             if icl_len > 0 {
@@ -658,6 +664,10 @@ impl Qwen3TTS {
                 let last_icl_hidden = icl_hidden.i((.., icl_len - 1..icl_len, ..))?;
                 let new_logits = self.talker.apply_codec_head(&last_icl_hidden)?;
 
+                // Update last_hidden so the code predictor is conditioned on
+                // the ICL context, not the stale prefill hidden state.
+                last_hidden = last_icl_hidden;
+
                 (icl_trailing, new_logits)
             } else {
                 let trailing = self.build_default_trailing_text(&input_ids)?;
@@ -670,8 +680,6 @@ impl Qwen3TTS {
 
         let trailing_text_len = trailing_text_hidden.dim(1)?;
         let tts_pad_embed = self.talker.get_tts_pad_embed()?;
-
-        let mut last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
 
         // Track generated tokens for repetition penalty
         let mut generated_tokens: Vec<u32> = Vec::new();
@@ -868,6 +876,9 @@ impl Qwen3TTS {
         let options = options.unwrap_or_default();
         let input_ids = self.text_tokenizer.encode(text)?;
 
+        // Determine if ICL mode is active (ref_codes + ref_text present)
+        let is_icl = prompt.ref_codes.is_some() && prompt.ref_text_ids.is_some();
+
         let gen_config = generation::GenerationConfig {
             max_new_tokens: options.max_length,
             temperature: options.temperature,
@@ -878,16 +889,22 @@ impl Qwen3TTS {
             min_new_tokens: options.min_new_tokens,
         };
 
-        // Voice clone prefill
+        // Voice clone prefill (9 positions for ICL, 10 for x_vector_only)
         let mut kv_caches = self.talker.new_kv_caches();
         let (hidden, logits) = self.talker.prefill_voice_clone(
             &input_ids,
             &prompt.speaker_embedding,
             language,
+            is_icl,
             &mut kv_caches,
         )?;
         let prefill_len = hidden.dim(1)?;
         let mut offset = prefill_len;
+
+        // Initialize last_hidden from prefill; updated by ICL block if active.
+        // The code predictor uses this to condition acoustic code generation —
+        // it must come from the position that produced the first semantic logits.
+        let mut last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
 
         // ── ICL extension (if reference codes + text are provided) ──────────
         let (trailing_text_hidden, logits) = if let (Some(ref_codes), Some(ref_text_ids)) =
@@ -896,15 +913,11 @@ impl Qwen3TTS {
             // Sum reference codec embeddings across all 16 codebook groups
             let ref_codec_embeds = self.sum_ref_codec_embeddings(ref_codes)?;
 
-            // Build ICL prompt: pairs (ref_text + target_text) with ref_codec embeddings
-            let target_text = if input_ids.len() > 1 {
-                &input_ids[1..]
-            } else {
-                &[]
-            };
+            // In ICL mode, all text tokens go into the ICL prompt (Python:
+            // text_id=input_id[:, 3:-5] passes ALL target text tokens).
             let (icl_embed, icl_trailing) =
                 self.talker
-                    .build_icl_prompt(target_text, ref_text_ids, &ref_codec_embeds)?;
+                    .build_icl_prompt(&input_ids, ref_text_ids, &ref_codec_embeds)?;
 
             // Feed ICL embeddings through the model to extend the KV cache.
             // Process in a single pass (no generation, just context extension).
@@ -937,6 +950,10 @@ impl Qwen3TTS {
                 let last_icl_hidden = icl_hidden.i((.., icl_len - 1..icl_len, ..))?;
                 let new_logits = self.talker.apply_codec_head(&last_icl_hidden)?;
 
+                // Update last_hidden so the code predictor is conditioned on
+                // the ICL context, not the stale prefill hidden state.
+                last_hidden = last_icl_hidden;
+
                 (icl_trailing, new_logits)
             } else {
                 // No ICL content, fall back to default trailing text
@@ -951,8 +968,6 @@ impl Qwen3TTS {
 
         let trailing_text_len = trailing_text_hidden.dim(1)?;
         let tts_pad_embed = self.talker.get_tts_pad_embed()?;
-
-        let mut last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
 
         // Track generated tokens for repetition penalty
         let mut generated_tokens: Vec<u32> = Vec::new();

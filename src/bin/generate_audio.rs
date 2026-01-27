@@ -230,6 +230,21 @@ fn run_voice_clone(args: &Args) -> Result<()> {
     // Create voice clone prompt (x_vector_only or ICL depending on --ref-text)
     let prompt = model.create_voice_clone_prompt(&ref_audio, args.ref_text.as_deref())?;
 
+    // Debug: print ref_codes info if ICL mode
+    if let Some(ref codes) = &prompt.ref_codes {
+        let shape = codes.shape();
+        println!("ref_codes shape: {:?}", shape);
+        // Print first frame
+        let first_frame: Vec<u32> = codes.i(0)?.to_vec1()?;
+        println!("ref_codes[0] (first frame): {:?}", first_frame);
+        // Print first 10 semantic codes
+        let semantic: Vec<u32> = codes.i((.., 0))?.to_vec1::<u32>()?;
+        println!(
+            "First 10 semantic codes: {:?}",
+            &semantic[..10.min(semantic.len())]
+        );
+    }
+
     let language = parse_language(&args.language)?;
 
     // Calculate max frames from duration if specified
@@ -249,11 +264,23 @@ fn run_voice_clone(args: &Args) -> Result<()> {
     };
 
     println!("Generating up to {} frames...", max_frames);
-    let audio = model.synthesize_voice_clone(&args.text, &prompt, language, Some(options))?;
+    let (audio, codes) =
+        model.synthesize_voice_clone_debug(&args.text, &prompt, language, Some(options))?;
     println!(
-        "Generated: {:.2}s, {} samples",
+        "Generated: {:.2}s, {} samples, {} frames",
         audio.duration(),
-        audio.len()
+        audio.len(),
+        codes.len()
+    );
+
+    // Print semantic tokens for debugging
+    let semantic_tokens: Vec<u32> = codes.iter().map(|f| f[0]).collect();
+    println!("Semantic tokens: {:?}", &semantic_tokens);
+    let has_eos = semantic_tokens.contains(&qwen3_tts::CODEC_EOS_TOKEN_ID);
+    println!(
+        "Contains EOS ({}): {}",
+        qwen3_tts::CODEC_EOS_TOKEN_ID,
+        has_eos
     );
 
     // Determine output path
@@ -527,7 +554,10 @@ fn main() -> Result<()> {
         // Check EOS before processing this frame
         if let Some(eos_id) = gen_config.eos_token_id {
             if semantic_token == eos_id {
-                println!("EOS token {} at frame {} — stopping generation", eos_id, frame_idx);
+                println!(
+                    "EOS token {} at frame {} — stopping generation",
+                    eos_id, frame_idx
+                );
                 break;
             }
         }

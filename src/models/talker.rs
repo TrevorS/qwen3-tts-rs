@@ -527,16 +527,22 @@ impl TalkerModel {
     /// The codec sequence becomes:
     /// `[think, think_bos, lang, think_eos, SPEAKER_EMBED, pad, bos]`
     ///
+    /// When `icl_mode` is `true`, the final position (first_text + codec_bos) is
+    /// omitted — that content moves into the ICL prompt instead, matching the
+    /// Python reference implementation (9 positions vs 10).
+    ///
     /// # Arguments
     /// * `text_tokens` — tokenized target text
     /// * `speaker_embed` — speaker embedding from the encoder, shape `[hidden_size]`
     /// * `language` — target language
+    /// * `icl_mode` — if true, omit position 9 (first_text + codec_bos)
     /// * `kv_caches` — KV caches to populate
     pub fn prefill_voice_clone(
         &self,
         text_tokens: &[u32],
         speaker_embed: &Tensor,
         language: Language,
+        icl_mode: bool,
         kv_caches: &mut [KVCache],
     ) -> Result<(Tensor, Tensor)> {
         use codec_tokens::*;
@@ -594,8 +600,10 @@ impl TalkerModel {
         // === 4. Combine role prefix + codec portion ===
         let mut hidden = Tensor::cat(&[&role_prefix_hidden, &codec_hidden], 1)?; // [1, 9, hidden]
 
-        // === 5. First text token + codec_bos ===
-        if !text_tokens.is_empty() {
+        // === 5. First text token + codec_bos (skipped in ICL mode) ===
+        // In ICL mode, all text tokens go into the ICL prompt instead, and
+        // codec_bos is the first token of the ICL codec sequence.
+        if !icl_mode && !text_tokens.is_empty() {
             let first_text_id = Tensor::new(&[text_tokens[0]], &self.device)?;
             let first_text_embed = self.text_embedding.forward(&first_text_id)?.unsqueeze(0)?;
             let first_text_proj = self.text_projection.forward(&first_text_embed)?;
@@ -623,25 +631,28 @@ impl TalkerModel {
 
     /// Build ICL (in-context learning) prompt for voice cloning.
     ///
-    /// Constructs an additional context sequence that teaches the model a speaker's voice
-    /// by pairing reference text with reference audio codec embeddings.
+    /// Uses **streaming mode** (the official Python default, `non_streaming_mode=False`):
+    /// text and codec embeddings are aligned element-wise. If one is shorter, it
+    /// is padded with the appropriate fill embedding.
+    ///
+    /// **Note:** ICL voice cloning requires GPU (bfloat16 / flash attention) to
+    /// produce intelligible speech. On CPU with float32, both the official Python
+    /// and this Rust implementation produce unintelligible output. The x_vector_only
+    /// mode works correctly on CPU.
     ///
     /// # Algorithm
     ///
-    /// 1. Text side: `text_proj(text_embed([ref_text..., target_text..., tts_eos]))`
+    /// 1. Text side: `text_proj(text_embed([ref_text, target_text, tts_eos]))`
     /// 2. Codec side: `[codec_bos, ref_frame_0, ref_frame_1, ...]` (pre-summed across groups)
-    /// 3. Align by length (pad shorter with tts_pad / zeros, split trailing text if longer)
-    /// 4. Element-wise add aligned portions → ICL embeddings
-    ///
-    /// # Arguments
-    /// * `target_text_ids` — tokenized target text
-    /// * `ref_text_ids` — tokenized reference text
-    /// * `ref_codec_embeds` — pre-summed reference codec embeddings, shape `[1, T_ref, hidden]`
+    /// 3. Streaming overlay (element-wise):
+    ///    - If `N_text > N_codec`: `icl = text[:N_codec] + codec`, trailing = `text[N_codec:]`
+    ///    - If `N_codec >= N_text`: pad text with `tts_pad` to N_codec, `icl = padded_text + codec`,
+    ///      trailing = `tts_pad`
     ///
     /// # Returns
     /// `(icl_embed, trailing_text_embed)` where:
-    /// - `icl_embed`: `[1, L, hidden]` — ICL context to feed through the model
-    /// - `trailing_text_embed`: `[1, T_trail, hidden]` — leftover text for the generation loop
+    /// - `icl_embed`: `[1, max(N_text, N_codec), hidden]` — ICL context
+    /// - `trailing_text_embed`: remaining text or `tts_pad`
     pub fn build_icl_prompt(
         &self,
         target_text_ids: &[u32],
@@ -667,40 +678,28 @@ impl TalkerModel {
         let codec_embed = Tensor::cat(&[&bos_embed, ref_codec_embeds], 1)?; // [1, T_ref+1, hidden]
         let n_codec = codec_embed.dim(1)?;
 
-        // --- 3. Align text and codec ---
-        let paired_len = n_text.min(n_codec);
+        // --- 3. Streaming overlay (element-wise, matching official Python default) ---
+        let tts_pad_embed = self.get_tts_pad_embed()?; // [1, 1, hidden]
 
-        let text_paired = text_embed.i((.., ..paired_len, ..))?;
-        let codec_paired = codec_embed.i((.., ..paired_len, ..))?;
-
-        // If codec is longer, pad text side with tts_pad
-        let (text_aligned, codec_aligned) = if n_codec > n_text {
-            let tts_pad_proj = self.get_tts_pad_embed()?; // [1, 1, hidden]
+        if n_text > n_codec {
+            // Text is longer: align text[:n_codec] + codec, trailing = text[n_codec:]
+            let text_head = text_embed.i((.., ..n_codec, ..))?;
+            let icl_embed = text_head.add(&codec_embed)?;
+            let trailing = text_embed.i((.., n_codec.., ..))?;
+            Ok((icl_embed, trailing))
+        } else {
+            // Codec is longer (or equal): pad text with tts_pad, then element-wise add
             let pad_count = n_codec - n_text;
-            let pad_expanded =
-                tts_pad_proj.broadcast_as((1, pad_count, self.config.hidden_size))?;
-            let text_full = Tensor::cat(&[&text_paired, &pad_expanded], 1)?;
-            (text_full, codec_embed.clone())
-        } else {
-            (text_paired.contiguous()?, codec_paired.contiguous()?)
-        };
-
-        // Element-wise add for the aligned (paired) portion
-        let icl_embed = text_aligned.add(&codec_aligned)?;
-
-        // --- 4. Trailing text: unpaired text tokens for the generation loop ---
-        let trailing_text_embed = if n_text > n_codec {
-            text_embed.i((.., paired_len.., ..))?
-        } else {
-            // No trailing text — return empty
-            Tensor::zeros(
-                (1, 0, self.config.hidden_size),
-                candle_core::DType::F32,
-                &self.device,
-            )?
-        };
-
-        Ok((icl_embed, trailing_text_embed))
+            let padded_text = if pad_count > 0 {
+                let pad_broadcast =
+                    tts_pad_embed.broadcast_as((1, pad_count, self.config.hidden_size))?;
+                Tensor::cat(&[&text_embed, &pad_broadcast], 1)?
+            } else {
+                text_embed
+            };
+            let icl_embed = padded_text.add(&codec_embed)?;
+            Ok((icl_embed, tts_pad_embed))
+        }
     }
 
     /// Generate step with pre-built input embedding
