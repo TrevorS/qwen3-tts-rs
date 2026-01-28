@@ -129,13 +129,12 @@ def parse_args() -> argparse.Namespace:
 
 # ── Paths ───────────────────────────────────────────────────────────────
 
-def find_paths() -> tuple[Path, Path, Path]:
-    """Return (repo_root, project_root, binary_path)."""
+def find_paths() -> tuple[Path, Path]:
+    """Return (repo_root, binary_path)."""
     script_dir = Path(__file__).resolve().parent
     repo_root = script_dir.parent
-    project_root = repo_root.parent
     binary = repo_root / "target" / "release" / "generate_audio"
-    return repo_root, project_root, binary
+    return repo_root, binary
 
 
 # ── Build ───────────────────────────────────────────────────────────────
@@ -730,8 +729,8 @@ def serve_results(output_base: Path, hostname: str, port: int) -> None:
 
 def main() -> None:
     args = parse_args()
-    repo_root, project_root, binary = find_paths()
-    output_base = project_root / "test_data" / "variant_tests"
+    repo_root, binary = find_paths()
+    output_base = repo_root / "test_data" / "variant_tests"
     output_base.mkdir(parents=True, exist_ok=True)
 
     # Build

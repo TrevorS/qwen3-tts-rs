@@ -17,7 +17,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PROJECT_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 
 BIN="$REPO_ROOT/target/release/generate_audio"
 MODELS_DIR="$REPO_ROOT/test_data/models"
@@ -25,7 +24,7 @@ REF_AUDIO="$REPO_ROOT/examples/data/apollo11_one_small_step.wav"
 REF_TEXT="That's one small step for man, one giant leap for mankind."
 TEXT="Hello world, this is a test."
 INSTRUCT="A cheerful young female voice with clear pronunciation and natural intonation."
-OUTPUT_BASE="$PROJECT_ROOT/test_data/variant_tests"
+OUTPUT_BASE="$REPO_ROOT/test_data/variant_tests"
 SEED=42
 DURATION=3.0
 
