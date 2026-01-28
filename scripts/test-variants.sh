@@ -9,6 +9,9 @@
 #   ./scripts/test-variants.sh --serve           # start HTTP server after tests
 #   ./scripts/test-variants.sh --build           # build release binary first
 #   ./scripts/test-variants.sh --hostname mymachine  # override hostname for URLs
+#   ./scripts/test-variants.sh --random          # use a random seed
+#   ./scripts/test-variants.sh --batch 5         # run each test 5x with seeds 42..46
+#   ./scripts/test-variants.sh --random --batch 3  # 3 runs starting from a random seed
 
 set -euo pipefail
 
@@ -21,6 +24,7 @@ MODELS_DIR="$REPO_ROOT/test_data/models"
 REF_AUDIO="$REPO_ROOT/examples/data/apollo11_one_small_step.wav"
 REF_TEXT="That's one small step for man, one giant leap for mankind."
 TEXT="Hello world, this is a test."
+INSTRUCT="A cheerful young female voice with clear pronunciation and natural intonation."
 OUTPUT_BASE="$PROJECT_ROOT/test_data/variant_tests"
 SEED=42
 DURATION=3.0
@@ -29,6 +33,8 @@ DURATION=3.0
 DEVICES=()
 SERVE=false
 BUILD=false
+RANDOM_SEED=false
+BATCH_COUNT=1
 HOSTNAME="${HOSTNAME:-$(hostname)}"
 HTTP_PORT=8765
 
@@ -37,6 +43,8 @@ while [[ $# -gt 0 ]]; do
         --device)   DEVICES+=("$2"); shift 2 ;;
         --serve)    SERVE=true; shift ;;
         --build)    BUILD=true; shift ;;
+        --random)   RANDOM_SEED=true; shift ;;
+        --batch)    BATCH_COUNT="$2"; shift 2 ;;
         --hostname) HOSTNAME="$2"; shift 2 ;;
         --port)     HTTP_PORT="$2"; shift 2 ;;
         --text)     TEXT="$2"; shift 2 ;;
@@ -49,16 +57,33 @@ while [[ $# -gt 0 ]]; do
             echo "  --device DEV    Test specific device(s). Repeat for multiple. Default: auto-detect."
             echo "  --serve         Start HTTP server after tests complete."
             echo "  --build         Build release binary before testing."
+            echo "  --random        Use a random seed instead of the default (42)."
+            echo "  --batch N       Run each test N times with seeds SEED, SEED+1, ..., SEED+N-1."
             echo "  --hostname H    Hostname for HTTP URLs (default: \$HOSTNAME)."
             echo "  --port P        HTTP server port (default: 8765)."
             echo "  --text TEXT     Text to synthesize (default: \"Hello world, this is a test.\")."
-            echo "  --seed N        Random seed (default: 42)."
+            echo "  --seed N        Base seed (default: 42). Combined with --random, this is ignored."
             echo "  --duration S    Duration in seconds (default: 3.0)."
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+# ── Resolve seed ────────────────────────────────────────────────────
+if $RANDOM_SEED; then
+    SEED=$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')
+    echo "Random seed: $SEED"
+fi
+
+# Build seeds array: [SEED, SEED+1, ..., SEED+BATCH_COUNT-1]
+SEEDS=()
+for ((b=0; b<BATCH_COUNT; b++)); do
+    SEEDS+=( $((SEED + b)) )
+done
+if [[ $BATCH_COUNT -gt 1 ]]; then
+    echo "Batch mode: $BATCH_COUNT seeds (${SEEDS[0]}..${SEEDS[-1]})"
+fi
 
 # ── Build ─────────────────────────────────────────────────────────────
 if $BUILD; then
@@ -150,12 +175,6 @@ for model_dir in "$MODELS_DIR"/*/; do
         fi
     fi
 
-    # Skip VoiceDesign — CLI doesn't support text-prompted voice design yet
-    if [[ "${MODEL_TYPES[$name]}" == "voicedesign" ]]; then
-        echo "SKIP: $name (VoiceDesign requires text-prompted voice descriptions, not yet in CLI)"
-        continue
-    fi
-
     MODEL_NAMES+=("$name")
 done
 
@@ -196,8 +215,12 @@ for name in "${MODEL_NAMES[@]}"; do
         else
             echo "WARN: Skipping base model $name (no reference audio: $REF_AUDIO)"
         fi
+    elif [[ "$model_type" == "voicedesign" ]]; then
+        # VoiceDesign models: text-described voice via --instruct
+        add_test "${name}-instruct" \
+            --model-dir "$model_dir" --instruct "$INSTRUCT"
     else
-        # CustomVoice / VoiceDesign: preset speakers
+        # CustomVoice: preset speakers
         tokenizer_args=()
         if [[ -f "$model_dir/tokenizer.json" ]]; then
             tokenizer_args=(--tokenizer-dir "$model_dir")
@@ -209,66 +232,77 @@ for name in "${MODEL_NAMES[@]}"; do
     fi
 done
 
-echo "Test matrix: ${#TEST_LABELS[@]} tests x ${#DEVICES[@]} devices = $(( ${#TEST_LABELS[@]} * ${#DEVICES[@]} )) runs"
+total_runs=$(( ${#TEST_LABELS[@]} * ${#DEVICES[@]} * BATCH_COUNT ))
+echo "Test matrix: ${#TEST_LABELS[@]} tests x ${#DEVICES[@]} devices x ${BATCH_COUNT} seed(s) = ${total_runs} runs"
 echo ""
 
 # ── Run tests ────────────────────────────────────────────────────────
 # Results arrays
 declare -a RESULT_LABELS=()
 declare -a RESULT_DEVICES=()
+declare -a RESULT_SEEDS=()
 declare -a RESULT_TIMES=()
 declare -a RESULT_STATUSES=()
 declare -a RESULT_SIZES=()
 declare -a RESULT_FILES=()
 
-total_runs=$(( ${#TEST_LABELS[@]} * ${#DEVICES[@]} ))
 run_num=0
 
 for device in "${DEVICES[@]}"; do
     device_dir="$OUTPUT_BASE/$device"
     mkdir -p "$device_dir"
 
-    for i in "${!TEST_LABELS[@]}"; do
-        label="${TEST_LABELS[$i]}"
-        # Retrieve the args array for this test
-        eval "test_args=(\"\${TEST_${i}_ARGS[@]}\")"
-        run_num=$((run_num + 1))
-        outfile="$device_dir/${label}.wav"
+    for seed in "${SEEDS[@]}"; do
+        for i in "${!TEST_LABELS[@]}"; do
+            base_label="${TEST_LABELS[$i]}"
+            # Retrieve the args array for this test
+            eval "test_args=(\"\${TEST_${i}_ARGS[@]}\")"
+            run_num=$((run_num + 1))
 
-        printf "[%d/%d] %-12s %-30s " "$run_num" "$total_runs" "$device" "$label"
+            # When batching, include seed in label and filename
+            if [[ $BATCH_COUNT -gt 1 ]]; then
+                label="${base_label}-s${seed}"
+            else
+                label="$base_label"
+            fi
+            outfile="$device_dir/${label}.wav"
 
-        # Run and capture time
-        start_time=$(date +%s%N)
-        if "$BIN" --device "$device" "${test_args[@]}" \
-            --text "$TEXT" --duration "$DURATION" --seed "$SEED" \
-            --output "$outfile" >/dev/null 2>&1; then
-            status="PASS"
-        else
-            status="FAIL"
-        fi
-        end_time=$(date +%s%N)
-        elapsed_ms=$(( (end_time - start_time) / 1000000 ))
-        elapsed_s=$(awk "BEGIN{printf \"%.1f\", $elapsed_ms/1000}")
+            printf "[%d/%d] %-12s %-35s " "$run_num" "$total_runs" "$device" "$label"
 
-        # File size
-        if [[ -f "$outfile" ]]; then
-            size=$(du -h "$outfile" | cut -f1)
-        else
-            size="-"
-        fi
+            # Run and capture time
+            start_time=$(date +%s%N)
+            if "$BIN" --device "$device" "${test_args[@]}" \
+                --text "$TEXT" --duration "$DURATION" --seed "$seed" \
+                --output "$outfile" >/dev/null 2>&1; then
+                status="PASS"
+            else
+                status="FAIL"
+            fi
+            end_time=$(date +%s%N)
+            elapsed_ms=$(( (end_time - start_time) / 1000000 ))
+            elapsed_s=$(awk "BEGIN{printf \"%.1f\", $elapsed_ms/1000}")
 
-        RESULT_LABELS+=("$label")
-        RESULT_DEVICES+=("$device")
-        RESULT_TIMES+=("$elapsed_s")
-        RESULT_STATUSES+=("$status")
-        RESULT_SIZES+=("$size")
-        RESULT_FILES+=("$outfile")
+            # File size
+            if [[ -f "$outfile" ]]; then
+                size=$(du -h "$outfile" | cut -f1)
+            else
+                size="-"
+            fi
 
-        if [[ "$status" == "PASS" ]]; then
-            printf "%-6s %6ss  %s\n" "$status" "$elapsed_s" "$size"
-        else
-            printf "%-6s %6ss  (failed)\n" "$status" "$elapsed_s"
-        fi
+            RESULT_LABELS+=("$label")
+            RESULT_DEVICES+=("$device")
+            RESULT_SEEDS+=("$seed")
+            RESULT_TIMES+=("$elapsed_s")
+            RESULT_STATUSES+=("$status")
+            RESULT_SIZES+=("$size")
+            RESULT_FILES+=("$outfile")
+
+            if [[ "$status" == "PASS" ]]; then
+                printf "%-6s %6ss  %s\n" "$status" "$elapsed_s" "$size"
+            else
+                printf "%-6s %6ss  (failed)\n" "$status" "$elapsed_s"
+            fi
+        done
     done
 done
 
@@ -282,13 +316,13 @@ echo ""
 # Build comparison table if multiple devices
 if [[ ${#DEVICES[@]} -gt 1 ]]; then
     # Header
-    printf "%-30s" "Test"
+    printf "%-40s" "Test"
     for d in "${DEVICES[@]}"; do
         printf "  %10s" "$d"
     done
     printf "  %10s\n" "Speedup"
 
-    printf "%-30s" "$(printf '%.0s─' {1..30})"
+    printf "%-40s" "$(printf '%.0s─' {1..40})"
     for d in "${DEVICES[@]}"; do
         printf "  %10s" "──────────"
     done
@@ -305,7 +339,7 @@ if [[ ${#DEVICES[@]} -gt 1 ]]; then
     done
 
     for label in "${unique_labels[@]}"; do
-        printf "%-30s" "$label"
+        printf "%-40s" "$label"
         declare -A device_times=()
         for i in "${!RESULT_LABELS[@]}"; do
             if [[ "${RESULT_LABELS[$i]}" == "$label" ]]; then
@@ -341,10 +375,10 @@ if [[ ${#DEVICES[@]} -gt 1 ]]; then
         echo ""
     done
 else
-    printf "%-30s  %10s  %6s  %s\n" "Test" "Device" "Time" "Size"
-    printf "%-30s  %10s  %6s  %s\n" "$(printf '%.0s─' {1..30})" "──────────" "──────" "────"
+    printf "%-40s  %10s  %6s  %s\n" "Test" "Device" "Time" "Size"
+    printf "%-40s  %10s  %6s  %s\n" "$(printf '%.0s─' {1..40})" "──────────" "──────" "────"
     for i in "${!RESULT_LABELS[@]}"; do
-        printf "%-30s  %10s  %5ss  %s\n" \
+        printf "%-40s  %10s  %5ss  %s\n" \
             "${RESULT_LABELS[$i]}" "${RESULT_DEVICES[$i]}" \
             "${RESULT_TIMES[$i]}" "${RESULT_SIZES[$i]}"
     done
@@ -371,9 +405,9 @@ results_json="$OUTPUT_BASE/results.json"
     for i in "${!RESULT_LABELS[@]}"; do
         [[ $i -gt 0 ]] && echo ","
         relpath="${RESULT_FILES[$i]#$OUTPUT_BASE/}"
-        printf '  {"label":"%s","device":"%s","time":"%s","status":"%s","size":"%s","file":"%s"}' \
+        printf '  {"label":"%s","device":"%s","seed":%s,"time":"%s","status":"%s","size":"%s","file":"%s"}' \
             "${RESULT_LABELS[$i]}" "${RESULT_DEVICES[$i]}" \
-            "${RESULT_TIMES[$i]}" "${RESULT_STATUSES[$i]}" \
+            "${RESULT_SEEDS[$i]}" "${RESULT_TIMES[$i]}" "${RESULT_STATUSES[$i]}" \
             "${RESULT_SIZES[$i]}" "$relpath"
     done
     echo ""
@@ -414,7 +448,12 @@ HTMLHEAD
 
 # Add metadata
 {
-    echo "<p class=\"meta\">Generated: $(date -Iseconds) &mdash; Text: &quot;${TEXT}&quot; &mdash; Seed: ${SEED} &mdash; Duration: ${DURATION}s</p>"
+    if [[ $BATCH_COUNT -gt 1 ]]; then
+        seed_info="Seeds: ${SEEDS[0]}&ndash;${SEEDS[-1]} (${BATCH_COUNT} runs)"
+    else
+        seed_info="Seed: ${SEED}"
+    fi
+    echo "<p class=\"meta\">Generated: $(date -Iseconds) &mdash; Text: &quot;${TEXT}&quot; &mdash; ${seed_info} &mdash; Duration: ${DURATION}s</p>"
 
     # Summary table
     echo "<h2>Summary</h2>"
@@ -486,7 +525,7 @@ HTMLHEAD
                 relpath="${RESULT_FILES[$i]#$OUTPUT_BASE/}"
                 echo "<div class=\"card\">"
                 echo "  <h3>${RESULT_LABELS[$i]}</h3>"
-                echo "  <div class=\"details\">${RESULT_TIMES[$i]}s &mdash; ${RESULT_SIZES[$i]}</div>"
+                echo "  <div class=\"details\">seed ${RESULT_SEEDS[$i]} &mdash; ${RESULT_TIMES[$i]}s &mdash; ${RESULT_SIZES[$i]}</div>"
                 echo "  <audio controls preload=\"metadata\" src=\"$relpath\"></audio>"
                 echo "</div>"
             fi

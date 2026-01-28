@@ -639,6 +639,115 @@ impl TalkerModel {
         Ok((hidden, logits))
     }
 
+    /// Prefill for VoiceDesign model with text-described voice conditioning.
+    ///
+    /// Constructs the full input sequence matching the Python implementation:
+    /// - Instruct embedding: text_proj(instruct_tokens) — variable length (N positions)
+    /// - Positions 0-2 (relative): role prefix (text_proj of im_start, assistant, newline)
+    /// - Positions 3-7: tts_pad/tts_bos ADDED with codec embeddings (no speaker token)
+    ///   - 3: tts_pad + codec_think
+    ///   - 4: tts_pad + codec_think_bos
+    ///   - 5: tts_pad + language_id
+    ///   - 6: tts_pad + codec_think_eos
+    ///   - 7: tts_bos + codec_pad
+    /// - Position 8: first_text_proj + codec_bos
+    ///
+    /// Key differences from CustomVoice:
+    /// - Instruct embedding prepended before role prefix
+    /// - No speaker token → codec prefix is 6 tokens not 7
+    /// - TTS pad overlay is 4 copies not 5
+    ///
+    /// Returns (hidden_states, logits) for generation.
+    pub fn prefill_voice_design(
+        &self,
+        text_tokens: &[u32],
+        instruct_tokens: &[u32],
+        language: Language,
+        kv_caches: &mut [KVCache],
+    ) -> Result<(Tensor, Tensor)> {
+        use codec_tokens::*;
+        use special_tokens::*;
+        use tts_tokens::*;
+
+        // === 1. Instruct embedding: text_proj(instruct_tokens) ===
+        let instruct_embed = self.get_projected_text_embeddings(instruct_tokens)?; // [1, N, hidden]
+
+        // === 2. Role prefix: text_proj([im_start, assistant, newline]) ===
+        let role_prefix_ids = Tensor::new(&[IM_START, ASSISTANT, NEWLINE], &self.device)?;
+        let role_prefix_embed = self.text_embedding.forward(&role_prefix_ids)?;
+        let role_prefix_embed = role_prefix_embed.unsqueeze(0)?;
+        let role_prefix_hidden = self.text_projection.forward(&role_prefix_embed)?; // [1, 3, hidden]
+
+        // === 3. Codec embeddings (NO speaker): [think, think_bos, lang, think_eos, pad, bos] ===
+        let codec_tokens_list = vec![
+            CODEC_THINK,
+            CODEC_THINK_BOS,
+            language.token_id(),
+            CODEC_THINK_EOS,
+            CODEC_PAD,
+            CODEC_BOS,
+        ];
+        let codec_ids = Tensor::new(codec_tokens_list.as_slice(), &self.device)?;
+        let codec_embed = self.codec_embedding.forward(&codec_ids)?;
+        let codec_embed = codec_embed.unsqueeze(0)?; // [1, 6, hidden]
+
+        // === 4. TTS pad/bos text embeddings ===
+        // 4 × tts_pad + 1 × tts_bos = 5 total to add with first 5 codec tokens
+        let tts_pad_id = Tensor::new(&[TTS_PAD], &self.device)?;
+        let tts_pad_embed = self.text_embedding.forward(&tts_pad_id)?;
+        let tts_pad_embed = tts_pad_embed.unsqueeze(0)?;
+        let tts_pad_proj = self.text_projection.forward(&tts_pad_embed)?; // [1, 1, hidden]
+
+        let tts_bos_id = Tensor::new(&[TTS_BOS], &self.device)?;
+        let tts_bos_embed = self.text_embedding.forward(&tts_bos_id)?;
+        let tts_bos_embed = tts_bos_embed.unsqueeze(0)?;
+        let tts_bos_proj = self.text_projection.forward(&tts_bos_embed)?; // [1, 1, hidden]
+
+        // Expand tts_pad to 4 copies and concat with tts_bos
+        let tts_pad_expanded = tts_pad_proj.broadcast_as((1, 4, self.config.hidden_size))?;
+        let tts_text_embed = Tensor::cat(&[&tts_pad_expanded, &tts_bos_proj], 1)?; // [1, 5, hidden]
+
+        // Add tts text embeddings with first 5 codec embeddings
+        let codec_first5 = codec_embed.i((.., ..5, ..))?; // [1, 5, hidden]
+        let codec_hidden = tts_text_embed.add(&codec_first5)?; // [1, 5, hidden]
+
+        // === 5. Combine instruct + role prefix + codec part ===
+        let mut hidden = Tensor::cat(&[&instruct_embed, &role_prefix_hidden, &codec_hidden], 1)?;
+
+        // === 6. Add first text token (text_proj + codec_bos) ===
+        if !text_tokens.is_empty() {
+            let first_text_id = Tensor::new(&[text_tokens[0]], &self.device)?;
+            let first_text_embed = self.text_embedding.forward(&first_text_id)?;
+            let first_text_embed = first_text_embed.unsqueeze(0)?;
+            let first_text_proj = self.text_projection.forward(&first_text_embed)?; // [1, 1, hidden]
+
+            // Add with codec_bos (last token of codec_embed, index 5)
+            let codec_bos_embed = codec_embed.i((.., 5..6, ..))?; // [1, 1, hidden]
+            let first_combined = first_text_proj.add(&codec_bos_embed)?;
+
+            hidden = Tensor::cat(&[&hidden, &first_combined], 1)?;
+        }
+
+        let seq_len = hidden.dim(1)?;
+
+        // Create causal mask
+        let mask = self.create_causal_mask(seq_len, 0)?;
+
+        // Run through all layers
+        for (i, layer) in self.layers.iter().enumerate() {
+            hidden = layer.forward(&hidden, &self.rope, Some(&mask), Some(&mut kv_caches[i]), 0)?;
+        }
+
+        // Final norm
+        hidden = self.norm.forward(&hidden)?;
+
+        // Get logits for last position
+        let last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
+        let logits = self.codec_head.forward(&last_hidden)?;
+
+        Ok((hidden, logits))
+    }
+
     /// Build ICL (in-context learning) prompt for voice cloning.
     ///
     /// Supports two modes controlled by `non_streaming`:

@@ -88,6 +88,10 @@ struct Args {
     #[arg(long)]
     custom_voice: bool,
 
+    /// Voice description for VoiceDesign model (e.g. "A cheerful young female voice")
+    #[arg(long)]
+    instruct: Option<String>,
+
     /// Reference audio WAV file for voice cloning (x_vector_only mode)
     #[arg(long)]
     ref_audio: Option<String>,
@@ -161,6 +165,15 @@ struct GenerationMetadata {
 
 /// Validate CLI arg combinations and bail early on contradictory flags.
 fn validate_args(args: &Args) -> Result<()> {
+    // --instruct and --ref-audio are mutually exclusive
+    if args.instruct.is_some() && args.ref_audio.is_some() {
+        anyhow::bail!(
+            "--instruct and --ref-audio are mutually exclusive.\n  \
+             --instruct is for VoiceDesign models (text-described voices).\n  \
+             --ref-audio is for Base models (voice cloning from reference audio)."
+        );
+    }
+
     // --ref-text requires --ref-audio (ref text is an ICL transcript for voice cloning)
     if args.ref_text.is_some() && args.ref_audio.is_none() {
         anyhow::bail!("--ref-text requires --ref-audio (reference text is the transcript of the reference audio for ICL voice cloning)");
@@ -310,6 +323,78 @@ fn run_voice_clone(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// VoiceDesign path: uses text-described voice conditioning when --instruct is provided.
+fn run_voice_design(args: &Args) -> Result<()> {
+    let instruct = args.instruct.as_ref().expect("--instruct required");
+
+    println!("=== VoiceDesign Generation ===");
+    println!("Text: {}", args.text);
+    println!("Instruct: {}", instruct);
+
+    // Set seed
+    generation::set_seed(args.seed);
+    generation::reset_rng();
+    println!("Seed: {}", args.seed);
+
+    let device = parse_device(&args.device)?;
+    println!("Device: {}", device_info(&device));
+    let model = Qwen3TTS::from_pretrained(&args.model_dir, device)?;
+
+    if !model.supports_voice_design() {
+        eprintln!(
+            "  WARNING: This model is not a VoiceDesign variant. \
+             Voice design synthesis may produce unpredictable results."
+        );
+    }
+
+    let language = parse_language(&args.language)?;
+
+    // Calculate max frames from duration if specified
+    let max_frames = if let Some(duration) = args.duration {
+        (duration * 12.5) as usize
+    } else {
+        args.frames
+    };
+
+    let options = SynthesisOptions {
+        max_length: max_frames,
+        temperature: args.temperature,
+        top_k: args.top_k,
+        top_p: args.top_p,
+        repetition_penalty: args.repetition_penalty,
+        ..Default::default()
+    };
+
+    println!("Generating up to {} frames...", max_frames);
+    let audio = model.synthesize_voice_design(&args.text, instruct, language, Some(options))?;
+    println!(
+        "Generated: {:.2}s, {} samples",
+        audio.duration(),
+        audio.len()
+    );
+
+    // Determine output path
+    let output_path = if let Some(ref out) = args.output {
+        std::path::PathBuf::from(out)
+    } else {
+        let output_dir = Path::new(&args.output_dir);
+        fs::create_dir_all(output_dir)?;
+        output_dir.join(format!("audio_seed{}_frames{}.wav", args.seed, max_frames))
+    };
+
+    // Ensure parent directory exists
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    audio.save(&output_path)?;
+    println!("Saved WAV to: {}", output_path.display());
+
+    generation::clear_seed();
+    println!("Generation complete!");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt::init();
@@ -320,6 +405,11 @@ fn main() -> Result<()> {
     // Voice clone path: when --ref-audio is provided, use the high-level API
     if args.ref_audio.is_some() {
         return run_voice_clone(&args);
+    }
+
+    // VoiceDesign path: when --instruct is provided, use text-described voice conditioning
+    if args.instruct.is_some() {
+        return run_voice_design(&args);
     }
 
     // Calculate frames from duration if specified
@@ -428,16 +518,19 @@ fn main() -> Result<()> {
                 }
             }
             ModelType::VoiceDesign => {
-                eprintln!();
-                eprintln!(
-                    "  NOTE: This is a {} model (text-described voices).",
-                    cfg.label()
-                );
-                eprintln!("  VoiceDesign synthesis is not yet implemented in the CLI.");
-                eprintln!(
-                    "  Falling back to preset speaker prefill — voice will be unpredictable."
-                );
-                eprintln!();
+                if args.instruct.is_none() {
+                    eprintln!();
+                    eprintln!(
+                        "  WARNING: This is a {} model (text-described voices).",
+                        cfg.label()
+                    );
+                    eprintln!(
+                        "  Without --instruct, falling back to preset speaker prefill — voice will be unpredictable."
+                    );
+                    eprintln!("  Recommended usage:");
+                    eprintln!("    --instruct \"A cheerful young female voice with high pitch\"");
+                    eprintln!();
+                }
             }
         }
     }

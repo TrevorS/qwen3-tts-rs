@@ -447,6 +447,13 @@ impl Qwen3TTS {
         }
     }
 
+    /// Whether this model supports voice design (text-described voice conditioning).
+    ///
+    /// Returns `true` for VoiceDesign, `false` for all other variants.
+    pub fn supports_voice_design(&self) -> bool {
+        matches!(&self.model_type, Some(ModelType::VoiceDesign))
+    }
+
     /// Synthesize speech from text with default voice (Ryan, English).
     ///
     /// Convenience wrapper around [`synthesize_with_voice`](Self::synthesize_with_voice).
@@ -593,6 +600,146 @@ impl Qwen3TTS {
             last_hidden = h;
 
             // Sample next semantic token with repetition penalty + token suppression + min_new_tokens
+            let logits_2d = new_logits.squeeze(1)?;
+            let logits_2d = self.apply_generation_penalties(
+                &logits_2d,
+                &generated_tokens,
+                &gen_config,
+                generated_tokens.len(),
+            )?;
+            let next_token = generation::sample(&logits_2d, &gen_config)?;
+            semantic_token = next_token.flatten_all()?.to_vec1::<u32>()?[0];
+            generated_tokens.push(semantic_token);
+        }
+
+        // Decode to audio
+        let codes = self.codes_to_tensor(&all_codes)?;
+        let waveform = self.decoder.decode(&codes)?;
+        AudioBuffer::from_tensor(waveform, 24000)
+    }
+
+    /// Synthesize speech using a text-described voice (VoiceDesign model).
+    ///
+    /// Uses the same generation loop as [`synthesize_with_voice`] but runs the
+    /// VoiceDesign prefill instead of the predefined-speaker prefill. The voice
+    /// is conditioned on a natural language description (e.g., "A cheerful young
+    /// female voice with high pitch and energetic tone").
+    ///
+    /// The instruct text is tokenized with ChatML framing:
+    /// `<|im_start|>user\n{instruct}<|im_end|>\n`
+    ///
+    /// # Arguments
+    ///
+    /// * `text` - Text to synthesize
+    /// * `instruct` - Natural language voice description
+    /// * `language` - Target language
+    /// * `options` - Synthesis options (temperature, top_k, etc.)
+    pub fn synthesize_voice_design(
+        &self,
+        text: &str,
+        instruct: &str,
+        language: Language,
+        options: Option<SynthesisOptions>,
+    ) -> Result<AudioBuffer> {
+        if let Some(ref mt) = self.model_type {
+            if *mt != ModelType::VoiceDesign {
+                tracing::warn!(
+                    "Using VoiceDesign synthesis on a {:?} model. This model was not trained \
+                     for text-described voice conditioning — output may be unpredictable.",
+                    mt
+                );
+            }
+        }
+
+        let options = options.unwrap_or_default();
+        let input_ids = self.text_tokenizer.encode(text)?;
+
+        // Tokenize instruct with ChatML user framing: <|im_start|>user\n{instruct}<|im_end|>\n
+        let instruct_text = format!("<|im_start|>user\n{}<|im_end|>\n", instruct);
+        let instruct_ids = self.text_tokenizer.encode(&instruct_text)?;
+
+        let gen_config = generation::GenerationConfig {
+            max_new_tokens: options.max_length,
+            temperature: options.temperature,
+            top_k: options.top_k,
+            top_p: options.top_p,
+            repetition_penalty: options.repetition_penalty,
+            eos_token_id: options.eos_token_id,
+            min_new_tokens: options.min_new_tokens,
+        };
+
+        // Build trailing text: remaining text tokens projected + tts_eos
+        let trailing_text_hidden = if input_ids.len() > 1 {
+            let remaining_proj = self.talker.get_projected_text_embeddings(&input_ids[1..])?;
+            let tts_eos_embed = self.talker.get_tts_eos_embed()?;
+            Tensor::cat(&[&remaining_proj, &tts_eos_embed], 1)?
+        } else {
+            self.talker.get_tts_eos_embed()?
+        };
+        let trailing_text_len = trailing_text_hidden.dim(1)?;
+        let tts_pad_embed = self.talker.get_tts_pad_embed()?;
+
+        // Prefill with VoiceDesign format
+        let mut kv_caches = self.talker.new_kv_caches();
+        let (hidden, logits) = self.talker.prefill_voice_design(
+            &input_ids,
+            &instruct_ids,
+            language,
+            &mut kv_caches,
+        )?;
+        let prefill_len = hidden.dim(1)?;
+        let mut offset = prefill_len;
+        let mut last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
+
+        // Track generated tokens for repetition penalty
+        let mut generated_tokens: Vec<u32> = Vec::new();
+
+        // Sample first semantic token
+        let logits_2d = logits.squeeze(1)?;
+        let logits_2d =
+            self.apply_generation_penalties(&logits_2d, &generated_tokens, &gen_config, 0)?;
+        let first_token = generation::sample(&logits_2d, &gen_config)?;
+        let mut semantic_token: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
+        generated_tokens.push(semantic_token);
+
+        let mut all_codes: Vec<Vec<u32>> = Vec::new();
+
+        // Generation loop: identical to synthesize_with_voice
+        for frame_idx in 0..gen_config.max_new_tokens {
+            if let Some(eos_id) = gen_config.eos_token_id {
+                if semantic_token == eos_id {
+                    break;
+                }
+            }
+
+            let semantic_embed = self.talker.get_codec_embedding(semantic_token)?;
+
+            let acoustic_codes = self
+                .code_predictor
+                .generate_acoustic_codes(&last_hidden, &semantic_embed)?;
+
+            let mut frame_codes = vec![semantic_token];
+            frame_codes.extend(&acoustic_codes);
+            all_codes.push(frame_codes);
+
+            let acoustic_embed_sum = self
+                .code_predictor
+                .get_acoustic_embeddings_sum(&acoustic_codes, &self.device)?;
+            let summed = semantic_embed.add(&acoustic_embed_sum)?;
+
+            let text_addition = if frame_idx < trailing_text_len {
+                trailing_text_hidden.i((.., frame_idx..frame_idx + 1, ..))?
+            } else {
+                tts_pad_embed.clone()
+            };
+            let step_input = summed.add(&text_addition)?;
+
+            let (h, new_logits) =
+                self.talker
+                    .generate_step_with_embed(&step_input, &mut kv_caches, offset)?;
+            offset += 1;
+            last_hidden = h;
+
             let logits_2d = new_logits.squeeze(1)?;
             let logits_2d = self.apply_generation_penalties(
                 &logits_2d,
