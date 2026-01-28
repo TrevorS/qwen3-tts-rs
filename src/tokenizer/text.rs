@@ -56,11 +56,23 @@ impl TextTokenizer {
             return Self::from_file(&tokenizer_path);
         }
 
-        // For remote loading, we'd need hf-hub crate
-        // For now, return an error suggesting local download
+        // Try downloading from HuggingFace Hub
+        #[cfg(feature = "hub")]
+        {
+            tracing::info!("Downloading tokenizer from HuggingFace Hub: {}", model_id);
+            let api = hf_hub::api::sync::Api::new()
+                .map_err(|e| anyhow!("Failed to create HuggingFace API client: {}", e))?;
+            let repo = api.model(model_id.to_string());
+            let tokenizer_file = repo
+                .get("tokenizer.json")
+                .map_err(|e| anyhow!("Failed to download tokenizer.json: {}", e))?;
+            Self::from_file(&tokenizer_file)
+        }
+
+        #[cfg(not(feature = "hub"))]
         Err(anyhow!(
-            "Remote tokenizer loading not yet implemented. \
-             Please download the tokenizer locally first: {}",
+            "Remote tokenizer loading requires the `hub` feature. \
+             Either enable it or download the tokenizer locally first: {}",
             model_id
         ))
     }

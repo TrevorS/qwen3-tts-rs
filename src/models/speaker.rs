@@ -356,8 +356,6 @@ pub struct SpeakerEncoder {
     mfa_tdnn: TimeDelayNetBlock,
     asp: AttentiveStatisticsPooling,
     fc: Conv1d,
-    #[allow(dead_code)]
-    config: SpeakerEncoderConfig,
     device: Device,
 }
 
@@ -428,7 +426,6 @@ impl SpeakerEncoder {
             mfa_tdnn,
             asp,
             fc,
-            config,
             device,
         })
     }

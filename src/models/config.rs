@@ -434,11 +434,23 @@ impl Qwen3TTSConfig {
             return Self::from_file(&config_path);
         }
 
-        // TODO: Download from HuggingFace Hub
-        // For now, return error
+        // Try downloading from HuggingFace Hub
+        #[cfg(feature = "hub")]
+        {
+            tracing::info!("Downloading config from HuggingFace Hub: {}", model_id);
+            let api =
+                hf_hub::api::sync::Api::new().context("Failed to create HuggingFace API client")?;
+            let repo = api.model(model_id.to_string());
+            let config_file = repo
+                .get("config.json")
+                .context("Failed to download config.json from HuggingFace Hub")?;
+            Self::from_file(&config_file)
+        }
+
+        #[cfg(not(feature = "hub"))]
         anyhow::bail!(
-            "Remote model loading not yet implemented. \
-             Please download the model locally first: {}",
+            "Remote model loading requires the `hub` feature. \
+             Either enable it or download the model locally first: {}",
             model_id
         )
     }
