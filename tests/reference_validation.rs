@@ -3005,7 +3005,7 @@ fn test_autoregressive_generation() -> Result<()> {
     // Test the full autoregressive pipeline:
     // Text → TalkerModel → CodePredictor → Decoder → Audio
     use candle_nn::VarBuilder;
-    use qwen3_tts::generation::{sample, GenerationConfig};
+    use qwen3_tts::generation::{sample, GenerationConfig, SamplingContext};
     use qwen3_tts::models::code_predictor::{CodePredictor, CodePredictorConfig};
     use qwen3_tts::models::codec::Decoder12Hz;
     use qwen3_tts::models::talker::TalkerModel;
@@ -3111,7 +3111,8 @@ fn test_autoregressive_generation() -> Result<()> {
     };
 
     // Sample first semantic token
-    let first_token = sample(&logits.squeeze(1)?, &gen_config)?;
+    let mut sampling_ctx = SamplingContext::new(Some(42));
+    let first_token = sample(&logits.squeeze(1)?, &gen_config, &mut sampling_ctx)?;
     let first_token_id: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
     println!("  First semantic token: {}", first_token_id);
 
@@ -3140,7 +3141,7 @@ fn test_autoregressive_generation() -> Result<()> {
         last_hidden = hidden;
 
         // Sample semantic token
-        let next_token = sample(&logits.squeeze(1)?, &gen_config)?;
+        let next_token = sample(&logits.squeeze(1)?, &gen_config, &mut sampling_ctx)?;
         let next_token_id: u32 = next_token.flatten_all()?.to_vec1::<u32>()?[0];
 
         // Generate acoustic tokens

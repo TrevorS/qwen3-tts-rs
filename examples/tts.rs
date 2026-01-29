@@ -60,7 +60,7 @@ fn main() -> Result<()> {
     // Public domain (NASA/US government work).
     // Note: the radio transmission artifacts will carry into the clone.
     // For best results, use clean studio-quality reference audio.
-    if model.has_speaker_encoder() {
+    if model.supports_voice_cloning() {
         let ref_audio = AudioBuffer::load("examples/data/apollo11_one_small_step.wav")?;
 
         // x_vector_only mode: speaker embedding only

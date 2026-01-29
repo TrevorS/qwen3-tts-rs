@@ -1,5 +1,12 @@
 # Cargo configuration for qwen3-tts-rs
 
+# Aliases — use these instead of --all-features (which fails on every platform
+# because metal/cuda/flash-attn/accelerate are mutually exclusive by OS).
+[alias]
+lint = "clippy --features all-portable -- -D warnings"
+check-all = "check --features all-portable"
+test-all = "test --features all-portable"
+
 # ARM aarch64: Enable fp16 target feature for half-precision float support
 # Required by the gemm crate for matrix operations on ARM processors
 [target.aarch64-unknown-linux-gnu]

@@ -13,6 +13,17 @@ env:
   CI_FEATURES: cli,hub
 
 jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uvx ruff check scripts/
+      - run: uvx ruff format --check scripts/
+      - run: uvx mdformat --check README.md
+      - run: shellcheck scripts/*.sh
+
   check:
     name: Check
     runs-on: ubuntu-latest

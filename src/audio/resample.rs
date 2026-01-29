@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use rubato::{
-    FastFixedIn, PolynomialDegree, Resampler as RubatoResampler, SincFixedIn,
+    audioadapter::Adapter, Async, FixedAsync, PolynomialDegree, Resampler as RubatoResampler,
     SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 
@@ -41,11 +41,10 @@ impl Resampler {
 
         let ratio = target_rate as f64 / audio.sample_rate as f64;
 
-        match self.quality {
-            ResampleQuality::Fast => self.resample_fast(audio, target_rate, ratio),
-            ResampleQuality::Normal | ResampleQuality::High => {
-                self.resample_sinc(audio, target_rate, ratio)
-            }
+        if matches!(self.quality, ResampleQuality::Fast) {
+            self.resample_fast(audio, target_rate, ratio)
+        } else {
+            self.resample_sinc(audio, target_rate, ratio)
         }
     }
 
@@ -58,12 +57,13 @@ impl Resampler {
     ) -> Result<AudioBuffer> {
         let chunk_size = 1024;
 
-        let mut resampler = FastFixedIn::<f32>::new(
+        let mut resampler = Async::<f32>::new_poly(
             ratio,
             1.0,
             PolynomialDegree::Cubic,
             chunk_size,
             1, // mono
+            FixedAsync::Input,
         )
         .context("Failed to create fast resampler")?;
 
@@ -96,8 +96,13 @@ impl Resampler {
             window: WindowFunction::BlackmanHarris2,
         };
 
-        let mut resampler = SincFixedIn::<f32>::new(
-            ratio, 1.0, params, chunk_size, 1, // mono
+        let mut resampler = Async::<f32>::new_sinc(
+            ratio,
+            1.0,
+            &params,
+            chunk_size,
+            1, // mono
+            FixedAsync::Input,
         )
         .context("Failed to create sinc resampler")?;
 
@@ -112,6 +117,8 @@ impl Resampler {
         samples: &[f32],
         chunk_size: usize,
     ) -> Result<Vec<f32>> {
+        use audioadapter_buffers::direct::SequentialSliceOfVecs;
+
         let mut output = Vec::new();
         let mut pos = 0;
 
@@ -120,20 +127,29 @@ impl Resampler {
             let chunk = &samples[pos..end];
 
             // Pad last chunk if needed
-            let input: Vec<Vec<f32>> = if chunk.len() < chunk_size {
-                let mut padded = chunk.to_vec();
-                padded.resize(chunk_size, 0.0);
-                vec![padded]
+            let padded;
+            let data: Vec<f32> = if chunk.len() < chunk_size {
+                padded = {
+                    let mut p = chunk.to_vec();
+                    p.resize(chunk_size, 0.0);
+                    p
+                };
+                padded.clone()
             } else {
-                vec![chunk.to_vec()]
+                chunk.to_vec()
             };
 
+            let input_vecs = vec![data];
+            let input = SequentialSliceOfVecs::new(&input_vecs, 1, chunk_size)
+                .context("Failed to create input adapter")?;
+
             let result = resampler
-                .process(&input, None)
+                .process(&input, 0, None)
                 .context("Resampling failed")?;
 
-            if let Some(channel) = result.first() {
-                output.extend_from_slice(channel);
+            let frames = result.frames();
+            for i in 0..frames {
+                output.push(result.read_sample(0, i).unwrap_or(0.0));
             }
 
             pos += chunk_size;
@@ -202,8 +218,8 @@ mod tests {
         let audio = AudioBuffer::new(vec![0.0; 1600], 16000);
         let result = resample(&audio, 24000).unwrap();
         assert_eq!(result.sample_rate, 24000);
-        // Should be approximately 1.5x the samples
-        assert!(result.len() > 2000 && result.len() < 3000);
+        // Should be approximately 1.5x the samples (padding may add extra)
+        assert!(result.len() > 2000 && result.len() < 4000);
     }
 
     #[test]

@@ -3,39 +3,44 @@
 This document describes the Qwen3-TTS (CustomVoice) architecture in detail, based on analysis of the official Python implementation.
 
 ## Table of Contents
-1. [Model Overview](#model-overview)
-2. [Key Components](#key-components)
-3. [Input Text Format](#input-text-format)
-4. [Input Embedding Construction](#input-embedding-construction)
-5. [Generation Loop](#generation-loop)
-6. [Code Predictor](#code-predictor)
-7. [Weight Names](#weight-names)
 
----
+1. [Model Overview](#model-overview)
+1. [Key Components](#key-components)
+1. [Input Text Format](#input-text-format)
+1. [Input Embedding Construction](#input-embedding-construction)
+1. [Generation Loop](#generation-loop)
+1. [Code Predictor](#code-predictor)
+1. [Weight Names](#weight-names)
+
+______________________________________________________________________
 
 ## Model Overview
 
 Qwen3-TTS consists of three main components:
 
 1. **Talker Model** (`Qwen3TTSTalkerForConditionalGeneration`)
+
    - A 28-layer transformer (hidden_size=2048, heads=16, kv_heads=8)
    - Generates semantic tokens autoregressively
    - Contains the code predictor as a submodule
 
-2. **Code Predictor** (`Qwen3TTSTalkerCodePredictorModelForConditionalGeneration`)
+1. **Code Predictor** (`Qwen3TTSTalkerCodePredictorModelForConditionalGeneration`)
+
    - A 5-layer transformer (hidden_size=1024, heads=16, kv_heads=8)
    - Generates 15 acoustic codes for each semantic token
    - Called DURING talker generation, not after
 
-3. **Decoder** (`Qwen3TTSTokenizerV2Model`)
+1. **Decoder** (`Qwen3TTSTokenizerV2Model`)
+
    - Converts semantic + acoustic codes to audio waveforms
    - 12Hz model: 1 frame = 2000 samples at 24kHz = 83.33ms
 
----
+______________________________________________________________________
 
 ## Key Components
 
 ### Talker Model Structure
+
 ```
 Qwen3TTSTalkerForConditionalGeneration
 ├── model (Qwen3TTSTalkerModel)
@@ -50,6 +55,7 @@ Qwen3TTSTalkerForConditionalGeneration
 ```
 
 ### Code Predictor Structure
+
 ```
 Qwen3TTSTalkerCodePredictorModelForConditionalGeneration
 ├── model (Qwen3TTSTalkerCodePredictorModel)
@@ -64,6 +70,7 @@ Qwen3TTSTalkerCodePredictorModelForConditionalGeneration
 ```
 
 ### ResizeMLP Structure (text_projection)
+
 ```python
 class Qwen3TTSTalkerResizeMLP(nn.Module):
     def __init__(self, input_size, intermediate_size, output_size, act, bias=False):
@@ -78,6 +85,7 @@ class Qwen3TTSTalkerResizeMLP(nn.Module):
 For text_projection: `ResizeMLP(2048, 2048, 2048, "silu", bias=True)`
 
 ### Special Token IDs (from config.json)
+
 ```
 # TTS special tokens (text embedding)
 tts_bos_token_id = 151672   # TTS begin of speech
@@ -110,21 +118,24 @@ chinese = 2055
 # etc.
 ```
 
----
+______________________________________________________________________
 
 ## Input Text Format
 
 The input text is formatted as a chat template:
+
 ```
 <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
 ```
 
 For example, "Hello" becomes:
+
 ```
 <|im_start|>assistant\nHello<|im_end|>\n<|im_start|>assistant\n
 ```
 
 When tokenized (approximate):
+
 ```
 Position | Token ID | Token
 ---------|----------|-------
@@ -140,11 +151,12 @@ Position | Token ID | Token
 ```
 
 The code references these positions:
+
 - `input_id[:, :3]` = role prefix: `[im_start, assistant, \n]`
 - `input_id[:, 3:-5]` = text content: `[Hello]`
 - `input_id[:, -5:]` = role suffix: `[im_end, \n, im_start, assistant, \n]`
 
----
+______________________________________________________________________
 
 ## Input Embedding Construction
 
@@ -175,6 +187,7 @@ _talker_input_embed_role = self.talker.text_projection(
 ### Step 3: Build Codec Control Sequence
 
 For specified language (e.g., English):
+
 ```python
 codec_prefill_list = [[
     codec_think_id,      # 2154: Thinking mode marker
@@ -186,6 +199,7 @@ codec_prefill_list = [[
 ```
 
 For auto language detection:
+
 ```python
 codec_prefill_list = [[
     codec_nothink_id,    # 2155: No-thinking mode
@@ -276,7 +290,7 @@ Position | Text Embedding (text_proj)   | Codec Embedding      | Combined
 9        | first_text ("Hello")         | bos_id (2149)        | added
 ```
 
----
+______________________________________________________________________
 
 ## Generation Loop
 
@@ -349,11 +363,12 @@ return Qwen3TTSTalkerOutputWithPast(
 ### Key Insight: Residual VQ Pattern
 
 The model uses **Residual Vector Quantization**. For each frame:
-1. The semantic token provides the coarse representation
-2. Each acoustic code refines the representation
-3. All 16 embeddings are **SUMMED** to create the input for the next step
 
----
+1. The semantic token provides the coarse representation
+1. Each acoustic code refines the representation
+1. All 16 embeddings are **SUMMED** to create the input for the next step
+
+______________________________________________________________________
 
 ## Code Predictor
 
@@ -411,11 +426,12 @@ self.lm_head = nn.ModuleList(
 # 2048 = acoustic codebook size
 ```
 
----
+______________________________________________________________________
 
 ## Weight Names
 
 ### Main Model Weights
+
 ```
 talker.model.text_embedding.weight              [151936, 2048]
 talker.model.codec_embedding.weight             [3072, 2048]
@@ -430,6 +446,7 @@ talker.codec_head.weight                        [3072, 2048]
 ```
 
 ### Code Predictor Weights
+
 ```
 talker.code_predictor.small_to_mtp_projection.{weight,bias}  [1024, 2048]
 talker.code_predictor.model.codec_embedding.{0-14}.weight    [2048, 2048]
@@ -441,15 +458,17 @@ talker.code_predictor.model.norm.weight
 talker.code_predictor.lm_head.{0-14}.weight                  [2048, 1024]
 ```
 
----
+______________________________________________________________________
 
 ## Decoder Notes
 
 The decoder expects codes in the shape `[batch, seq_len, 16]` where:
+
 - Column 0: semantic token
 - Columns 1-15: acoustic codes from code predictor
 
 **Important**: Semantic tokens >= 2048 are special control tokens and must be filtered out before decoding:
+
 - `codec_eos_token_id = 2150`: End of sequence
 - `codec_think_id = 2154`: Thinking mode marker
 - `codec_think_bos_id = 2156`: Think block start
@@ -463,14 +482,14 @@ valid_mask = semantic_tokens < 2048
 codes = codes[valid_mask]
 ```
 
----
+______________________________________________________________________
 
 ## Summary
 
 1. **Input format**: Text is wrapped in `<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n`
-2. **Text projection**: All text embeddings go through `text_projection` (2-layer MLP with SiLU)
-3. **Embedding combination**: Text embeddings and codec embeddings are **ADDED** together
-4. **Generation loop**: For each step, generate semantic token → call code predictor → sum all 16 embeddings → add trailing text → continue
-5. **Residual VQ**: All 16 code embeddings are summed for the next input
-6. **Trailing text**: Added incrementally during generation (streaming mode)
-7. **Token filtering**: Semantic tokens >= 2048 are control tokens and must be filtered before decoding
+1. **Text projection**: All text embeddings go through `text_projection` (2-layer MLP with SiLU)
+1. **Embedding combination**: Text embeddings and codec embeddings are **ADDED** together
+1. **Generation loop**: For each step, generate semantic token → call code predictor → sum all 16 embeddings → add trailing text → continue
+1. **Residual VQ**: All 16 code embeddings are summed for the next input
+1. **Trailing text**: Added incrementally during generation (streaming mode)
+1. **Token filtering**: Semantic tokens >= 2048 are control tokens and must be filtered before decoding

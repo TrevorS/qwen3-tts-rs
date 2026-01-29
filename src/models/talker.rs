@@ -20,6 +20,7 @@ use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Module, Tensor};
 use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
 use std::collections::HashMap;
+use std::str::FromStr;
 
 use super::config::Qwen3TTSConfig;
 use super::transformer::{DecoderLayer, KVCache, MRoPE, RoPEType, RotaryEmbedding};
@@ -41,12 +42,15 @@ pub mod tts_tokens {
 
 /// Codec special token IDs
 pub mod codec_tokens {
+    pub const CODEC_PAD: u32 = 2148;
+    pub const CODEC_BOS: u32 = 2149;
+    pub const CODEC_EOS: u32 = 2150;
     pub const CODEC_THINK: u32 = 2154;
     pub const CODEC_NOTHINK: u32 = 2155;
     pub const CODEC_THINK_BOS: u32 = 2156;
     pub const CODEC_THINK_EOS: u32 = 2157;
-    pub const CODEC_PAD: u32 = 2148;
-    pub const CODEC_BOS: u32 = 2149;
+    /// Total codec vocabulary size (semantic + acoustic + control tokens)
+    pub const CODEC_VOCAB_SIZE: usize = 3072;
 }
 
 /// Language IDs for codec prefix
@@ -62,6 +66,26 @@ pub enum Language {
     Portuguese,
     Spanish,
     Italian,
+}
+
+impl FromStr for Language {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "english" | "en" => Ok(Language::English),
+            "chinese" | "zh" => Ok(Language::Chinese),
+            "japanese" | "ja" => Ok(Language::Japanese),
+            "korean" | "ko" => Ok(Language::Korean),
+            "german" | "de" => Ok(Language::German),
+            "french" | "fr" => Ok(Language::French),
+            "russian" | "ru" => Ok(Language::Russian),
+            "portuguese" | "pt" => Ok(Language::Portuguese),
+            "spanish" | "es" => Ok(Language::Spanish),
+            "italian" | "it" => Ok(Language::Italian),
+            _ => anyhow::bail!("Unknown language: {}", s),
+        }
+    }
 }
 
 impl Language {
@@ -94,6 +118,25 @@ pub enum Speaker {
     Sohee,
     Eric,
     Dylan,
+}
+
+impl FromStr for Speaker {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "ryan" => Ok(Speaker::Ryan),
+            "serena" => Ok(Speaker::Serena),
+            "vivian" => Ok(Speaker::Vivian),
+            "aiden" => Ok(Speaker::Aiden),
+            "uncle_fu" | "unclefu" => Ok(Speaker::UncleFu),
+            "ono_anna" | "onoanna" => Ok(Speaker::OnoAnna),
+            "sohee" => Ok(Speaker::Sohee),
+            "eric" => Ok(Speaker::Eric),
+            "dylan" => Ok(Speaker::Dylan),
+            _ => anyhow::bail!("Unknown speaker: {}", s),
+        }
+    }
 }
 
 impl Speaker {
@@ -390,43 +433,6 @@ impl TalkerModel {
         })
     }
 
-    /// Prefill with text input
-    ///
-    /// Processes text tokens and returns (hidden_states, logits) for the last position.
-    /// KV caches are populated for subsequent generation steps.
-    pub fn prefill(
-        &self,
-        input_ids: &Tensor,
-        kv_caches: &mut [KVCache],
-    ) -> Result<(Tensor, Tensor)> {
-        let seq_len = input_ids.dim(1)?;
-
-        // Embed text tokens
-        let input_ids_flat = input_ids.flatten_all()?;
-        let text_embed = self.text_embedding.forward(&input_ids_flat)?;
-        let text_embed = text_embed.reshape((1, seq_len, self.config.text_embed_dim))?;
-
-        // Project to hidden dimension
-        let mut hidden = self.text_projection.forward(&text_embed)?;
-
-        // Create causal mask
-        let mask = self.create_causal_mask(seq_len, 0)?;
-
-        // Run through all layers
-        for (i, layer) in self.layers.iter().enumerate() {
-            hidden = layer.forward(&hidden, &self.rope, Some(&mask), Some(&mut kv_caches[i]), 0)?;
-        }
-
-        // Final norm
-        hidden = self.norm.forward(&hidden)?;
-
-        // Get logits for last position
-        let last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
-        let logits = self.codec_head.forward(&last_hidden)?;
-
-        Ok((hidden, logits))
-    }
-
     /// Prefill for CustomVoice model with speaker and language
     ///
     /// Constructs the full input sequence matching the Python implementation:
@@ -449,84 +455,38 @@ impl TalkerModel {
         kv_caches: &mut [KVCache],
     ) -> Result<(Tensor, Tensor)> {
         use codec_tokens::*;
-        use special_tokens::*;
-        use tts_tokens::*;
 
-        // === 1. Role prefix: text_proj([im_start, assistant, newline]) ===
-        let role_prefix_ids = Tensor::new(&[IM_START, ASSISTANT, NEWLINE], &self.device)?;
-        let role_prefix_embed = self.text_embedding.forward(&role_prefix_ids)?;
-        let role_prefix_embed = role_prefix_embed.unsqueeze(0)?;
-        let role_prefix_hidden = self.text_projection.forward(&role_prefix_embed)?; // [1, 3, hidden]
+        let role_prefix_hidden = self.build_role_prefix()?;
 
-        // === 2. Codec embeddings: [think, think_bos, lang, think_eos, speaker, pad, bos] ===
-        let codec_tokens_list = vec![
-            CODEC_THINK,
-            CODEC_THINK_BOS,
-            language.token_id(),
-            CODEC_THINK_EOS,
-            speaker.token_id(),
-            CODEC_PAD,
-            CODEC_BOS,
-        ];
-        let codec_ids = Tensor::new(codec_tokens_list.as_slice(), &self.device)?;
-        let codec_embed = self.codec_embedding.forward(&codec_ids)?;
-        let codec_embed = codec_embed.unsqueeze(0)?; // [1, 7, hidden]
+        // Codec: [think, think_bos, lang, think_eos, speaker, pad, bos]
+        let codec_ids = Tensor::new(
+            &[
+                CODEC_THINK,
+                CODEC_THINK_BOS,
+                language.token_id(),
+                CODEC_THINK_EOS,
+                speaker.token_id(),
+                CODEC_PAD,
+                CODEC_BOS,
+            ],
+            &self.device,
+        )?;
+        let codec_embed = self.codec_embedding.forward(&codec_ids)?.unsqueeze(0)?;
 
-        // === 3. TTS pad/bos text embeddings ===
-        // We need 5 tts_pad + 1 tts_bos = 6 total to add with first 6 codec tokens
-        let tts_pad_id = Tensor::new(&[TTS_PAD], &self.device)?;
-        let tts_pad_embed = self.text_embedding.forward(&tts_pad_id)?;
-        let tts_pad_embed = tts_pad_embed.unsqueeze(0)?; // [1, 1, embed_dim]
-        let tts_pad_proj = self.text_projection.forward(&tts_pad_embed)?; // [1, 1, hidden]
+        // 5 × tts_pad + 1 × tts_bos overlaid on first 6 codec tokens
+        let tts_text_embed = self.build_tts_pad_bos(5)?;
+        let codec_first6 = codec_embed.i((.., ..6, ..))?;
+        let codec_hidden = tts_text_embed.add(&codec_first6)?;
 
-        let tts_bos_id = Tensor::new(&[TTS_BOS], &self.device)?;
-        let tts_bos_embed = self.text_embedding.forward(&tts_bos_id)?;
-        let tts_bos_embed = tts_bos_embed.unsqueeze(0)?;
-        let tts_bos_proj = self.text_projection.forward(&tts_bos_embed)?; // [1, 1, hidden]
+        let mut hidden = Tensor::cat(&[&role_prefix_hidden, &codec_hidden], 1)?;
 
-        // Expand tts_pad to 5 copies and concat with tts_bos
-        let tts_pad_expanded = tts_pad_proj.broadcast_as((1, 5, self.config.hidden_size))?;
-        let tts_text_embed = Tensor::cat(&[&tts_pad_expanded, &tts_bos_proj], 1)?; // [1, 6, hidden]
-
-        // Add tts text embeddings with first 6 codec embeddings
-        let codec_first6 = codec_embed.i((.., ..6, ..))?; // [1, 6, hidden]
-        let codec_hidden = tts_text_embed.add(&codec_first6)?; // [1, 6, hidden]
-
-        // === 4. Combine role prefix and codec part ===
-        let mut hidden = Tensor::cat(&[&role_prefix_hidden, &codec_hidden], 1)?; // [1, 9, hidden]
-
-        // === 5. Add first text token (text_proj + codec_bos) ===
-        if !text_tokens.is_empty() {
-            let first_text_id = Tensor::new(&[text_tokens[0]], &self.device)?;
-            let first_text_embed = self.text_embedding.forward(&first_text_id)?;
-            let first_text_embed = first_text_embed.unsqueeze(0)?;
-            let first_text_proj = self.text_projection.forward(&first_text_embed)?; // [1, 1, hidden]
-
-            // Add with codec_bos (last token of codec_embed)
-            let codec_bos_embed = codec_embed.i((.., 6..7, ..))?; // [1, 1, hidden]
-            let first_combined = first_text_proj.add(&codec_bos_embed)?;
-
-            hidden = Tensor::cat(&[&hidden, &first_combined], 1)?; // [1, 10, hidden]
+        // First text token + codec_bos
+        let codec_bos_embed = codec_embed.i((.., 6..7, ..))?;
+        if let Some(combined) = self.build_first_text_combined(text_tokens, &codec_bos_embed)? {
+            hidden = Tensor::cat(&[&hidden, &combined], 1)?;
         }
 
-        let seq_len = hidden.dim(1)?;
-
-        // Create causal mask
-        let mask = self.create_causal_mask(seq_len, 0)?;
-
-        // Run through all layers
-        for (i, layer) in self.layers.iter().enumerate() {
-            hidden = layer.forward(&hidden, &self.rope, Some(&mask), Some(&mut kv_caches[i]), 0)?;
-        }
-
-        // Final norm
-        hidden = self.norm.forward(&hidden)?;
-
-        // Get logits for last position
-        let last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
-        let logits = self.codec_head.forward(&last_hidden)?;
-
-        Ok((hidden, logits))
+        self.run_prefill_layers(hidden, kv_caches)
     }
 
     /// Prefill for voice cloning (x_vector_only mode).
@@ -556,16 +516,10 @@ impl TalkerModel {
         kv_caches: &mut [KVCache],
     ) -> Result<(Tensor, Tensor)> {
         use codec_tokens::*;
-        use special_tokens::*;
-        use tts_tokens::*;
 
-        // === 1. Role prefix: text_proj([im_start, assistant, newline]) ===
-        let role_prefix_ids = Tensor::new(&[IM_START, ASSISTANT, NEWLINE], &self.device)?;
-        let role_prefix_embed = self.text_embedding.forward(&role_prefix_ids)?;
-        let role_prefix_embed = role_prefix_embed.unsqueeze(0)?;
-        let role_prefix_hidden = self.text_projection.forward(&role_prefix_embed)?;
+        let role_prefix_hidden = self.build_role_prefix()?;
 
-        // === 2. Codec embeddings: [think, think_bos, lang, think_eos] + speaker + [pad, bos] ===
+        // Codec: [think, think_bos, lang, think_eos] + speaker_embed + [pad, bos]
         let codec_prefix_ids = Tensor::new(
             &[
                 CODEC_THINK,
@@ -578,65 +532,34 @@ impl TalkerModel {
         let codec_prefix_embed = self
             .codec_embedding
             .forward(&codec_prefix_ids)?
-            .unsqueeze(0)?; // [1, 4, hidden]
+            .unsqueeze(0)?;
 
-        let speaker = speaker_embed.reshape((1, 1, self.config.hidden_size))?; // [1, 1, hidden]
+        let speaker = speaker_embed.reshape((1, 1, self.config.hidden_size))?;
 
         let codec_suffix_ids = Tensor::new(&[CODEC_PAD, CODEC_BOS], &self.device)?;
         let codec_suffix_embed = self
             .codec_embedding
             .forward(&codec_suffix_ids)?
-            .unsqueeze(0)?; // [1, 2, hidden]
+            .unsqueeze(0)?;
 
-        // Full codec: [4 prefix, 1 speaker, 2 suffix] = 7 positions
         let codec_embed = Tensor::cat(&[&codec_prefix_embed, &speaker, &codec_suffix_embed], 1)?;
 
-        // === 3. TTS text embeddings: 5 × tts_pad + 1 × tts_bos ===
-        let tts_pad_id = Tensor::new(&[TTS_PAD], &self.device)?;
-        let tts_pad_embed = self.text_embedding.forward(&tts_pad_id)?.unsqueeze(0)?;
-        let tts_pad_proj = self.text_projection.forward(&tts_pad_embed)?;
-
-        let tts_bos_id = Tensor::new(&[TTS_BOS], &self.device)?;
-        let tts_bos_embed = self.text_embedding.forward(&tts_bos_id)?.unsqueeze(0)?;
-        let tts_bos_proj = self.text_projection.forward(&tts_bos_embed)?;
-
-        let tts_pad_expanded = tts_pad_proj.broadcast_as((1, 5, self.config.hidden_size))?;
-        let tts_text_embed = Tensor::cat(&[&tts_pad_expanded, &tts_bos_proj], 1)?; // [1, 6, hidden]
-
-        // Element-wise add text + first 6 codec tokens
+        // 5 × tts_pad + 1 × tts_bos overlaid on first 6 codec tokens
+        let tts_text_embed = self.build_tts_pad_bos(5)?;
         let codec_first6 = codec_embed.i((.., ..6, ..))?;
         let codec_hidden = tts_text_embed.add(&codec_first6)?;
 
-        // === 4. Combine role prefix + codec portion ===
-        let mut hidden = Tensor::cat(&[&role_prefix_hidden, &codec_hidden], 1)?; // [1, 9, hidden]
+        let mut hidden = Tensor::cat(&[&role_prefix_hidden, &codec_hidden], 1)?;
 
-        // === 5. First text token + codec_bos (skipped in ICL mode) ===
-        // In ICL mode, all text tokens go into the ICL prompt instead, and
-        // codec_bos is the first token of the ICL codec sequence.
-        if !icl_mode && !text_tokens.is_empty() {
-            let first_text_id = Tensor::new(&[text_tokens[0]], &self.device)?;
-            let first_text_embed = self.text_embedding.forward(&first_text_id)?.unsqueeze(0)?;
-            let first_text_proj = self.text_projection.forward(&first_text_embed)?;
-
+        // First text token + codec_bos (skipped in ICL mode)
+        if !icl_mode {
             let codec_bos_embed = codec_embed.i((.., 6..7, ..))?;
-            let first_combined = first_text_proj.add(&codec_bos_embed)?;
-
-            hidden = Tensor::cat(&[&hidden, &first_combined], 1)?; // [1, 10, hidden]
+            if let Some(combined) = self.build_first_text_combined(text_tokens, &codec_bos_embed)? {
+                hidden = Tensor::cat(&[&hidden, &combined], 1)?;
+            }
         }
 
-        let seq_len = hidden.dim(1)?;
-        let mask = self.create_causal_mask(seq_len, 0)?;
-
-        for (i, layer) in self.layers.iter().enumerate() {
-            hidden = layer.forward(&hidden, &self.rope, Some(&mask), Some(&mut kv_caches[i]), 0)?;
-        }
-
-        hidden = self.norm.forward(&hidden)?;
-
-        let last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
-        let logits = self.codec_head.forward(&last_hidden)?;
-
-        Ok((hidden, logits))
+        self.run_prefill_layers(hidden, kv_caches)
     }
 
     /// Prefill for VoiceDesign model with text-described voice conditioning.
@@ -666,86 +589,40 @@ impl TalkerModel {
         kv_caches: &mut [KVCache],
     ) -> Result<(Tensor, Tensor)> {
         use codec_tokens::*;
-        use special_tokens::*;
-        use tts_tokens::*;
 
-        // === 1. Instruct embedding: text_proj(instruct_tokens) ===
-        let instruct_embed = self.get_projected_text_embeddings(instruct_tokens)?; // [1, N, hidden]
+        // Instruct text prefix
+        let instruct_embed = self.get_projected_text_embeddings(instruct_tokens)?;
 
-        // === 2. Role prefix: text_proj([im_start, assistant, newline]) ===
-        let role_prefix_ids = Tensor::new(&[IM_START, ASSISTANT, NEWLINE], &self.device)?;
-        let role_prefix_embed = self.text_embedding.forward(&role_prefix_ids)?;
-        let role_prefix_embed = role_prefix_embed.unsqueeze(0)?;
-        let role_prefix_hidden = self.text_projection.forward(&role_prefix_embed)?; // [1, 3, hidden]
+        let role_prefix_hidden = self.build_role_prefix()?;
 
-        // === 3. Codec embeddings (NO speaker): [think, think_bos, lang, think_eos, pad, bos] ===
-        let codec_tokens_list = vec![
-            CODEC_THINK,
-            CODEC_THINK_BOS,
-            language.token_id(),
-            CODEC_THINK_EOS,
-            CODEC_PAD,
-            CODEC_BOS,
-        ];
-        let codec_ids = Tensor::new(codec_tokens_list.as_slice(), &self.device)?;
-        let codec_embed = self.codec_embedding.forward(&codec_ids)?;
-        let codec_embed = codec_embed.unsqueeze(0)?; // [1, 6, hidden]
+        // Codec (no speaker): [think, think_bos, lang, think_eos, pad, bos]
+        let codec_ids = Tensor::new(
+            &[
+                CODEC_THINK,
+                CODEC_THINK_BOS,
+                language.token_id(),
+                CODEC_THINK_EOS,
+                CODEC_PAD,
+                CODEC_BOS,
+            ],
+            &self.device,
+        )?;
+        let codec_embed = self.codec_embedding.forward(&codec_ids)?.unsqueeze(0)?;
 
-        // === 4. TTS pad/bos text embeddings ===
-        // 4 × tts_pad + 1 × tts_bos = 5 total to add with first 5 codec tokens
-        let tts_pad_id = Tensor::new(&[TTS_PAD], &self.device)?;
-        let tts_pad_embed = self.text_embedding.forward(&tts_pad_id)?;
-        let tts_pad_embed = tts_pad_embed.unsqueeze(0)?;
-        let tts_pad_proj = self.text_projection.forward(&tts_pad_embed)?; // [1, 1, hidden]
+        // 4 × tts_pad + 1 × tts_bos overlaid on first 5 codec tokens
+        let tts_text_embed = self.build_tts_pad_bos(4)?;
+        let codec_first5 = codec_embed.i((.., ..5, ..))?;
+        let codec_hidden = tts_text_embed.add(&codec_first5)?;
 
-        let tts_bos_id = Tensor::new(&[TTS_BOS], &self.device)?;
-        let tts_bos_embed = self.text_embedding.forward(&tts_bos_id)?;
-        let tts_bos_embed = tts_bos_embed.unsqueeze(0)?;
-        let tts_bos_proj = self.text_projection.forward(&tts_bos_embed)?; // [1, 1, hidden]
-
-        // Expand tts_pad to 4 copies and concat with tts_bos
-        let tts_pad_expanded = tts_pad_proj.broadcast_as((1, 4, self.config.hidden_size))?;
-        let tts_text_embed = Tensor::cat(&[&tts_pad_expanded, &tts_bos_proj], 1)?; // [1, 5, hidden]
-
-        // Add tts text embeddings with first 5 codec embeddings
-        let codec_first5 = codec_embed.i((.., ..5, ..))?; // [1, 5, hidden]
-        let codec_hidden = tts_text_embed.add(&codec_first5)?; // [1, 5, hidden]
-
-        // === 5. Combine instruct + role prefix + codec part ===
         let mut hidden = Tensor::cat(&[&instruct_embed, &role_prefix_hidden, &codec_hidden], 1)?;
 
-        // === 6. Add first text token (text_proj + codec_bos) ===
-        if !text_tokens.is_empty() {
-            let first_text_id = Tensor::new(&[text_tokens[0]], &self.device)?;
-            let first_text_embed = self.text_embedding.forward(&first_text_id)?;
-            let first_text_embed = first_text_embed.unsqueeze(0)?;
-            let first_text_proj = self.text_projection.forward(&first_text_embed)?; // [1, 1, hidden]
-
-            // Add with codec_bos (last token of codec_embed, index 5)
-            let codec_bos_embed = codec_embed.i((.., 5..6, ..))?; // [1, 1, hidden]
-            let first_combined = first_text_proj.add(&codec_bos_embed)?;
-
-            hidden = Tensor::cat(&[&hidden, &first_combined], 1)?;
+        // First text token + codec_bos (index 5)
+        let codec_bos_embed = codec_embed.i((.., 5..6, ..))?;
+        if let Some(combined) = self.build_first_text_combined(text_tokens, &codec_bos_embed)? {
+            hidden = Tensor::cat(&[&hidden, &combined], 1)?;
         }
 
-        let seq_len = hidden.dim(1)?;
-
-        // Create causal mask
-        let mask = self.create_causal_mask(seq_len, 0)?;
-
-        // Run through all layers
-        for (i, layer) in self.layers.iter().enumerate() {
-            hidden = layer.forward(&hidden, &self.rope, Some(&mask), Some(&mut kv_caches[i]), 0)?;
-        }
-
-        // Final norm
-        hidden = self.norm.forward(&hidden)?;
-
-        // Get logits for last position
-        let last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
-        let logits = self.codec_head.forward(&last_hidden)?;
-
-        Ok((hidden, logits))
+        self.run_prefill_layers(hidden, kv_caches)
     }
 
     /// Build ICL (in-context learning) prompt for voice cloning.
@@ -865,26 +742,97 @@ impl TalkerModel {
         Ok((hidden, logits))
     }
 
-    /// Get tts_pad text embedding (projected)
+    /// Build the role prefix embeddings: text_proj([im_start, assistant, newline]).
     ///
-    /// This is added to codec embeddings during CustomVoice generation.
-    pub fn get_tts_pad_embed(&self) -> Result<Tensor> {
-        use tts_tokens::TTS_PAD;
-        let pad_id = Tensor::new(&[TTS_PAD], &self.device)?;
-        let pad_embed = self.text_embedding.forward(&pad_id)?;
-        let pad_embed = pad_embed.unsqueeze(0)?;
-        self.text_projection.forward(&pad_embed)
+    /// Returns a `[1, 3, hidden_size]` tensor used at the start of every prefill variant.
+    fn build_role_prefix(&self) -> Result<Tensor> {
+        use special_tokens::*;
+        let role_prefix_ids = Tensor::new(&[IM_START, ASSISTANT, NEWLINE], &self.device)?;
+        let role_prefix_embed = self.text_embedding.forward(&role_prefix_ids)?;
+        let role_prefix_embed = role_prefix_embed.unsqueeze(0)?;
+        self.text_projection.forward(&role_prefix_embed)
     }
 
-    /// Get tts_eos text embedding (projected)
+    /// Build tts_pad (projected, count copies) and tts_bos (projected, 1 copy).
+    ///
+    /// Returns a `[1, pad_count + 1, hidden_size]` tensor of
+    /// `[tts_pad × pad_count, tts_bos × 1]`.
+    fn build_tts_pad_bos(&self, pad_count: usize) -> Result<Tensor> {
+        use tts_tokens::*;
+        let tts_pad_id = Tensor::new(&[TTS_PAD], &self.device)?;
+        let tts_pad_embed = self.text_embedding.forward(&tts_pad_id)?.unsqueeze(0)?;
+        let tts_pad_proj = self.text_projection.forward(&tts_pad_embed)?;
+
+        let tts_bos_id = Tensor::new(&[TTS_BOS], &self.device)?;
+        let tts_bos_embed = self.text_embedding.forward(&tts_bos_id)?.unsqueeze(0)?;
+        let tts_bos_proj = self.text_projection.forward(&tts_bos_embed)?;
+
+        let tts_pad_expanded =
+            tts_pad_proj.broadcast_as((1, pad_count, self.config.hidden_size))?;
+        Ok(Tensor::cat(&[&tts_pad_expanded, &tts_bos_proj], 1)?)
+    }
+
+    /// Build first text token combined with codec_bos embedding.
+    ///
+    /// Returns `Some([1, 1, hidden_size])` if text_tokens is non-empty, `None` otherwise.
+    fn build_first_text_combined(
+        &self,
+        text_tokens: &[u32],
+        codec_bos_embed: &Tensor,
+    ) -> Result<Option<Tensor>> {
+        if text_tokens.is_empty() {
+            return Ok(None);
+        }
+        let first_text_id = Tensor::new(&[text_tokens[0]], &self.device)?;
+        let first_text_embed = self.text_embedding.forward(&first_text_id)?.unsqueeze(0)?;
+        let first_text_proj = self.text_projection.forward(&first_text_embed)?;
+        Ok(Some(first_text_proj.add(codec_bos_embed)?))
+    }
+
+    /// Run prefill through all layers: causal mask → layers → norm → logits.
+    ///
+    /// Returns `(hidden_states, logits)` for the full sequence.
+    fn run_prefill_layers(
+        &self,
+        mut hidden: Tensor,
+        kv_caches: &mut [KVCache],
+    ) -> Result<(Tensor, Tensor)> {
+        let seq_len = hidden.dim(1)?;
+        let mask = self.create_causal_mask(seq_len, 0)?;
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            hidden = layer.forward(&hidden, &self.rope, Some(&mask), Some(&mut kv_caches[i]), 0)?;
+        }
+
+        hidden = self.norm.forward(&hidden)?;
+
+        let last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
+        let logits = self.codec_head.forward(&last_hidden)?;
+
+        Ok((hidden, logits))
+    }
+
+    /// Get the projected text embedding for a single special token.
+    ///
+    /// Returns a `[1, 1, hidden_size]` tensor.
+    fn get_projected_special_embed(&self, token_id: u32) -> Result<Tensor> {
+        let id = Tensor::new(&[token_id], &self.device)?;
+        let embed = self.text_embedding.forward(&id)?.unsqueeze(0)?;
+        self.text_projection.forward(&embed)
+    }
+
+    /// Get tts_pad text embedding (projected).
+    ///
+    /// This is added to codec embeddings during generation after trailing text is exhausted.
+    pub fn get_tts_pad_embed(&self) -> Result<Tensor> {
+        self.get_projected_special_embed(tts_tokens::TTS_PAD)
+    }
+
+    /// Get tts_eos text embedding (projected).
     ///
     /// This marks the end of text input.
     pub fn get_tts_eos_embed(&self) -> Result<Tensor> {
-        use tts_tokens::TTS_EOS;
-        let eos_id = Tensor::new(&[TTS_EOS], &self.device)?;
-        let eos_embed = self.text_embedding.forward(&eos_id)?;
-        let eos_embed = eos_embed.unsqueeze(0)?;
-        self.text_projection.forward(&eos_embed)
+        self.get_projected_special_embed(tts_tokens::TTS_EOS)
     }
 
     /// Get projected text embeddings for a sequence of token IDs
@@ -901,57 +849,14 @@ impl TalkerModel {
             )?);
         }
 
-        let ids: Vec<u32> = token_ids.to_vec();
-        let ids_tensor = Tensor::new(ids.as_slice(), &self.device)?;
+        let ids_tensor = Tensor::new(token_ids, &self.device)?;
         let embeds = self.text_embedding.forward(&ids_tensor)?;
         let embeds = embeds.unsqueeze(0)?; // [1, seq_len, text_embed_dim]
         self.text_projection.forward(&embeds)
     }
 
-    /// Full forward pass without KV caching (for testing)
-    pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
-        let seq_len = input_ids.dim(1)?;
-
-        // Embed text tokens
-        let input_ids_flat = input_ids.flatten_all()?;
-        let text_embed = self.text_embedding.forward(&input_ids_flat)?;
-        let text_embed = text_embed.reshape((1, seq_len, self.config.text_embed_dim))?;
-
-        // Project to hidden dimension
-        let mut hidden = self.text_projection.forward(&text_embed)?;
-
-        // Create causal mask
-        let mask = self.create_causal_mask(seq_len, 0)?;
-
-        // Run through all layers without KV cache
-        for layer in &self.layers {
-            hidden = layer.forward(&hidden, &self.rope, Some(&mask), None, 0)?;
-        }
-
-        // Final norm
-        hidden = self.norm.forward(&hidden)?;
-
-        // Get logits for all positions
-        let logits = self.codec_head.forward(&hidden)?;
-
-        Ok(logits)
-    }
-
     fn create_causal_mask(&self, seq_len: usize, offset: usize) -> Result<Tensor> {
-        let total_len = offset + seq_len;
-        let mask: Vec<f32> = (0..seq_len)
-            .flat_map(|i| {
-                (0..total_len).map(move |j| {
-                    if j <= offset + i {
-                        0.0
-                    } else {
-                        f32::NEG_INFINITY
-                    }
-                })
-            })
-            .collect();
-
-        Ok(Tensor::new(mask.as_slice(), &self.device)?.reshape((1, 1, seq_len, total_len))?)
+        super::transformer::create_causal_mask(seq_len, offset, &self.device)
     }
 
     /// Create new KV caches for generation
@@ -1019,5 +924,51 @@ mod tests {
         assert_eq!(config.num_attention_heads, 16);
         assert_eq!(config.num_key_value_heads, 8);
         assert_eq!(config.head_dim, 128);
+    }
+
+    #[test]
+    fn test_language_from_str() {
+        assert_eq!("english".parse::<Language>().unwrap(), Language::English);
+        assert_eq!("en".parse::<Language>().unwrap(), Language::English);
+        assert_eq!("CHINESE".parse::<Language>().unwrap(), Language::Chinese);
+        assert_eq!("ja".parse::<Language>().unwrap(), Language::Japanese);
+        assert_eq!("ko".parse::<Language>().unwrap(), Language::Korean);
+        assert_eq!("de".parse::<Language>().unwrap(), Language::German);
+        assert_eq!("fr".parse::<Language>().unwrap(), Language::French);
+        assert_eq!("ru".parse::<Language>().unwrap(), Language::Russian);
+        assert_eq!("pt".parse::<Language>().unwrap(), Language::Portuguese);
+        assert_eq!("es".parse::<Language>().unwrap(), Language::Spanish);
+        assert_eq!("it".parse::<Language>().unwrap(), Language::Italian);
+        assert!("klingon".parse::<Language>().is_err());
+    }
+
+    #[test]
+    fn test_speaker_from_str() {
+        assert_eq!("ryan".parse::<Speaker>().unwrap(), Speaker::Ryan);
+        assert_eq!("SERENA".parse::<Speaker>().unwrap(), Speaker::Serena);
+        assert_eq!("vivian".parse::<Speaker>().unwrap(), Speaker::Vivian);
+        assert_eq!("aiden".parse::<Speaker>().unwrap(), Speaker::Aiden);
+        assert_eq!("uncle_fu".parse::<Speaker>().unwrap(), Speaker::UncleFu);
+        assert_eq!("unclefu".parse::<Speaker>().unwrap(), Speaker::UncleFu);
+        assert_eq!("ono_anna".parse::<Speaker>().unwrap(), Speaker::OnoAnna);
+        assert_eq!("onoanna".parse::<Speaker>().unwrap(), Speaker::OnoAnna);
+        assert_eq!("sohee".parse::<Speaker>().unwrap(), Speaker::Sohee);
+        assert_eq!("eric".parse::<Speaker>().unwrap(), Speaker::Eric);
+        assert_eq!("dylan".parse::<Speaker>().unwrap(), Speaker::Dylan);
+        assert!("unknown".parse::<Speaker>().is_err());
+    }
+
+    #[test]
+    fn test_language_token_ids() {
+        assert_eq!(Language::English.token_id(), 2050);
+        assert_eq!(Language::Chinese.token_id(), 2055);
+    }
+
+    #[test]
+    fn test_speaker_native_language() {
+        assert_eq!(Speaker::Ryan.native_language(), Language::English);
+        assert_eq!(Speaker::Serena.native_language(), Language::Chinese);
+        assert_eq!(Speaker::OnoAnna.native_language(), Language::Japanese);
+        assert_eq!(Speaker::Sohee.native_language(), Language::Korean);
     }
 }

@@ -96,7 +96,6 @@ use std::path::Path;
 
 use models::codec::{Decoder12Hz, Encoder12Hz};
 use models::speaker::SpeakerEncoder;
-use models::talker::TalkerModel;
 use models::KVCache;
 
 /// Re-exports for convenience
@@ -105,11 +104,16 @@ pub use audio::AudioBuffer;
 pub use hub::ModelPaths;
 pub use models::config::Qwen3TTSConfig;
 // StreamingSession is defined in this module, exported as top-level type
+pub use generation::SamplingContext;
 pub use models::talker::{codec_tokens, special_tokens, tts_tokens, Language, Speaker};
 pub use models::{
     CodePredictor, CodePredictorConfig, ModelType, ParsedModelConfig, SpeakerEncoderConfig,
-    TalkerConfig, TalkerModel as Talker,
+    TalkerConfig, TalkerModel,
 };
+
+/// A sequence of codec frames, where each frame contains 16 codebook values
+/// (1 semantic + 15 acoustic, formatted as `[semantic, acoustic_0..14]`).
+pub type FrameCodes = Vec<Vec<u32>>;
 
 /// Reference audio prompt for voice cloning.
 ///
@@ -157,14 +161,7 @@ impl Qwen3TTS {
     /// from `config.json` if present, falling back to weight inspection.
     pub fn from_pretrained(model_id: &str, device: Device) -> Result<Self> {
         tracing::info!("Loading Qwen3-TTS from: {}", model_id);
-
-        // BF16 on CUDA/Metal for half-precision acceleration, F32 on CPU
-        let compute_dtype = if device.is_cuda() || device.is_metal() {
-            DType::BF16
-        } else {
-            DType::F32
-        };
-        tracing::info!("Compute dtype: {:?}", compute_dtype);
+        tracing::info!("Compute dtype: {:?}", compute_dtype_for_device(&device));
 
         // Try to parse config.json for auto-detection
         let config_path = Path::new(model_id).join("config.json");
@@ -197,36 +194,7 @@ impl Qwen3TTS {
                 model_path.display()
             );
         }
-
         let weights = Self::load_weights(&model_path, &device)?;
-
-        // Create TalkerModel — prefer config.json, fallback to weight inspection
-        let talker = if let Some(ref cfg) = parsed_config {
-            let talker_config = TalkerConfig::from_parsed(cfg);
-            TalkerModel::from_weights_with_config_dtype(
-                &weights,
-                talker_config,
-                &device,
-                compute_dtype,
-            )?
-        } else {
-            TalkerModel::from_weights_with_config_dtype(
-                &weights,
-                TalkerConfig::default(),
-                &device,
-                compute_dtype,
-            )?
-        };
-
-        // Create CodePredictor — prefer config.json, fallback to defaults
-        let cp_config = if let Some(ref cfg) = parsed_config {
-            CodePredictorConfig::from_parsed(cfg)
-        } else {
-            CodePredictorConfig::default()
-        };
-        let cp_weights = Self::filter_weights(&weights, "talker.code_predictor.");
-        let cp_vb = candle_nn::VarBuilder::from_tensors(cp_weights, compute_dtype, &device);
-        let code_predictor = CodePredictor::new(cp_config, cp_vb)?;
 
         // Load speech tokenizer for decoder
         let st_path = Path::new(model_id).join("speech_tokenizer/model.safetensors");
@@ -248,32 +216,13 @@ impl Qwen3TTS {
             }
         };
 
-        // Create Decoder12Hz (always F32 — convolutional, no attention)
-        let decoder = Decoder12Hz::from_weights(&st_weights, Default::default())?;
-
-        // Load speaker encoder if weights are present (always F32)
-        let se_config = parsed_config
-            .as_ref()
-            .and_then(|c| c.speaker_encoder_config.clone());
-        let speaker_encoder =
-            Self::try_load_speaker_encoder(&weights, se_config.as_ref(), &device)?;
-
-        // Load speech encoder (for ICL voice cloning) from speech tokenizer weights
-        let speech_encoder = Self::try_load_speech_encoder(&st_weights, &device)?;
-
-        let model_type = parsed_config.as_ref().map(|c| c.model_type);
-
-        Ok(Self {
-            talker,
-            code_predictor,
-            decoder,
+        Self::build_from_components(
+            &weights,
+            &st_weights,
             text_tokenizer,
-            speaker_encoder,
-            speech_encoder,
-            model_type,
-            device,
-            compute_dtype,
-        })
+            parsed_config.as_ref(),
+            &device,
+        )
     }
 
     /// Load from pre-loaded weight tensors.
@@ -286,63 +235,7 @@ impl Qwen3TTS {
         text_tokenizer: tokenizer::TextTokenizer,
         device: &Device,
     ) -> Result<Self> {
-        let compute_dtype = if device.is_cuda() || device.is_metal() {
-            DType::BF16
-        } else {
-            DType::F32
-        };
-
-        // Create TalkerModel (auto-detects from weight shapes)
-        let norm_weight = model_weights
-            .get("talker.model.norm.weight")
-            .ok_or_else(|| anyhow::anyhow!("Missing talker.model.norm.weight"))?;
-        let hidden_size = norm_weight.dim(0)?;
-        let config = if hidden_size == 2048 {
-            TalkerConfig::custom_voice()
-        } else {
-            TalkerConfig::default()
-        };
-        let talker = TalkerModel::from_weights_with_config_dtype(
-            model_weights,
-            config,
-            device,
-            compute_dtype,
-        )?;
-
-        // Create CodePredictor — infer codec_embed_dim from talker hidden_size
-        let talker_hidden = talker.config().hidden_size;
-        let cp_config = if talker_hidden != 1024 {
-            CodePredictorConfig {
-                codec_embed_dim: Some(talker_hidden),
-                ..CodePredictorConfig::default()
-            }
-        } else {
-            CodePredictorConfig::default()
-        };
-        let cp_weights = Self::filter_weights(model_weights, "talker.code_predictor.");
-        let cp_vb = candle_nn::VarBuilder::from_tensors(cp_weights, compute_dtype, device);
-        let code_predictor = CodePredictor::new(cp_config, cp_vb)?;
-
-        // Create Decoder12Hz (always F32)
-        let decoder = Decoder12Hz::from_weights(decoder_weights, Default::default())?;
-
-        // Load speaker encoder if weights are present (always F32)
-        let speaker_encoder = Self::try_load_speaker_encoder(model_weights, None, device)?;
-
-        // Load speech encoder from decoder weights (same safetensors file)
-        let speech_encoder = Self::try_load_speech_encoder(decoder_weights, device)?;
-
-        Ok(Self {
-            talker,
-            code_predictor,
-            decoder,
-            text_tokenizer,
-            speaker_encoder,
-            speech_encoder,
-            model_type: None,
-            device: device.clone(),
-            compute_dtype,
-        })
+        Self::build_from_components(model_weights, decoder_weights, text_tokenizer, None, device)
     }
 
     /// Load from downloaded model paths.
@@ -362,54 +255,69 @@ impl Qwen3TTS {
     pub fn from_paths(paths: &hub::ModelPaths, device: Device) -> Result<Self> {
         tracing::info!("Loading Qwen3-TTS from downloaded paths...");
 
-        let compute_dtype = if device.is_cuda() || device.is_metal() {
-            DType::BF16
-        } else {
-            DType::F32
-        };
-
-        // Load text tokenizer
         let text_tokenizer = tokenizer::TextTokenizer::from_file(&paths.tokenizer)?;
-
-        // Load model weights
         let weights = Self::load_weights(&paths.model_weights, &device)?;
+        let st_weights = Self::load_weights(&paths.decoder_weights, &device)?;
 
-        // Create TalkerModel (auto-detects from weight shapes)
-        let norm_weight = weights
-            .get("talker.model.norm.weight")
-            .ok_or_else(|| anyhow::anyhow!("Missing talker.model.norm.weight"))?;
-        let hidden_size = norm_weight.dim(0)?;
-        let config = if hidden_size == 2048 {
-            TalkerConfig::custom_voice()
+        Self::build_from_components(&weights, &st_weights, text_tokenizer, None, &device)
+    }
+
+    /// Shared builder: assembles all model components from pre-loaded weights.
+    ///
+    /// When `parsed_config` is `Some`, uses config.json dimensions and model type.
+    /// When `None`, auto-detects the model variant from weight shapes.
+    fn build_from_components(
+        model_weights: &HashMap<String, Tensor>,
+        decoder_weights: &HashMap<String, Tensor>,
+        text_tokenizer: tokenizer::TextTokenizer,
+        parsed_config: Option<&ParsedModelConfig>,
+        device: &Device,
+    ) -> Result<Self> {
+        let compute_dtype = compute_dtype_for_device(device);
+
+        // Build TalkerModel
+        let talker_config = if let Some(cfg) = parsed_config {
+            TalkerConfig::from_parsed(cfg)
         } else {
-            TalkerConfig::default()
+            Self::detect_talker_config(model_weights)?
         };
-        let talker =
-            TalkerModel::from_weights_with_config_dtype(&weights, config, &device, compute_dtype)?;
+        let talker = TalkerModel::from_weights_with_config_dtype(
+            model_weights,
+            talker_config,
+            device,
+            compute_dtype,
+        )?;
 
-        // Create CodePredictor — infer codec_embed_dim from talker hidden_size
-        let talker_hidden = talker.config().hidden_size;
-        let cp_config = if talker_hidden != 1024 {
-            CodePredictorConfig {
-                codec_embed_dim: Some(talker_hidden),
-                ..CodePredictorConfig::default()
+        // Build CodePredictor
+        let cp_config = if let Some(cfg) = parsed_config {
+            CodePredictorConfig::from_parsed(cfg)
+        } else {
+            let talker_hidden = talker.config().hidden_size;
+            if talker_hidden != 1024 {
+                CodePredictorConfig {
+                    codec_embed_dim: Some(talker_hidden),
+                    ..CodePredictorConfig::default()
+                }
+            } else {
+                CodePredictorConfig::default()
             }
-        } else {
-            CodePredictorConfig::default()
         };
-        let cp_weights = Self::filter_weights(&weights, "talker.code_predictor.");
-        let cp_vb = candle_nn::VarBuilder::from_tensors(cp_weights, compute_dtype, &device);
+        let cp_weights = Self::filter_weights(model_weights, "talker.code_predictor.");
+        let cp_vb = candle_nn::VarBuilder::from_tensors(cp_weights, compute_dtype, device);
         let code_predictor = CodePredictor::new(cp_config, cp_vb)?;
 
-        // Load decoder weights (always F32)
-        let st_weights = Self::load_weights(&paths.decoder_weights, &device)?;
-        let decoder = Decoder12Hz::from_weights(&st_weights, Default::default())?;
+        // Decoder (always F32 — convolutional, no attention)
+        let decoder = Decoder12Hz::from_weights(decoder_weights, Default::default())?;
 
-        // Load speaker encoder if weights are present (always F32)
-        let speaker_encoder = Self::try_load_speaker_encoder(&weights, None, &device)?;
+        // Speaker encoder (always F32, only present in Base models)
+        let se_config = parsed_config.and_then(|c| c.speaker_encoder_config.clone());
+        let speaker_encoder =
+            Self::try_load_speaker_encoder(model_weights, se_config.as_ref(), device)?;
 
-        // Load speech encoder for ICL voice cloning
-        let speech_encoder = Self::try_load_speech_encoder(&st_weights, &device)?;
+        // Speech encoder for ICL voice cloning
+        let speech_encoder = Self::try_load_speech_encoder(decoder_weights, device)?;
+
+        let model_type = parsed_config.map(|c| c.model_type);
 
         Ok(Self {
             talker,
@@ -418,9 +326,22 @@ impl Qwen3TTS {
             text_tokenizer,
             speaker_encoder,
             speech_encoder,
-            model_type: None,
-            device,
+            model_type,
+            device: device.clone(),
             compute_dtype,
+        })
+    }
+
+    /// Detect talker config from weight shapes (fallback when no config.json).
+    fn detect_talker_config(weights: &HashMap<String, Tensor>) -> Result<TalkerConfig> {
+        let norm_weight = weights
+            .get("talker.model.norm.weight")
+            .ok_or_else(|| anyhow::anyhow!("Missing talker.model.norm.weight"))?;
+        let hidden_size = norm_weight.dim(0)?;
+        Ok(if hidden_size == 2048 {
+            TalkerConfig::custom_voice()
+        } else {
+            TalkerConfig::default()
         })
     }
 
@@ -459,6 +380,107 @@ impl Qwen3TTS {
     /// Convenience wrapper around [`synthesize_with_voice`](Self::synthesize_with_voice).
     pub fn synthesize(&self, text: &str, options: Option<SynthesisOptions>) -> Result<AudioBuffer> {
         self.synthesize_with_voice(text, Speaker::Ryan, Language::English, options)
+    }
+
+    /// Build trailing text embeddings from input token IDs.
+    ///
+    /// Returns (trailing_text_hidden, trailing_text_len, tts_pad_embed).
+    /// The trailing text is: remaining text tokens (all except first) projected + tts_eos.
+    /// After trailing text is exhausted, tts_pad is used for each subsequent step.
+    fn build_trailing_text(&self, input_ids: &[u32]) -> Result<(Tensor, usize, Tensor)> {
+        let trailing_text_hidden = if input_ids.len() > 1 {
+            let remaining_proj = self.talker.get_projected_text_embeddings(&input_ids[1..])?;
+            let tts_eos_embed = self.talker.get_tts_eos_embed()?;
+            Tensor::cat(&[&remaining_proj, &tts_eos_embed], 1)?
+        } else {
+            self.talker.get_tts_eos_embed()?
+        };
+        let trailing_text_len = trailing_text_hidden.dim(1)?;
+        let tts_pad_embed = self.talker.get_tts_pad_embed()?;
+        Ok((trailing_text_hidden, trailing_text_len, tts_pad_embed))
+    }
+
+    /// Core generation loop shared by all synthesis methods.
+    ///
+    /// Runs the autoregressive generation loop: for each frame, check EOS,
+    /// generate acoustic codes via CodePredictor, build the residual VQ sum
+    /// with trailing text fusion, and sample the next semantic token.
+    ///
+    /// Callers handle prefill (which varies by model variant) and post-processing
+    /// (decode, ICL ref_codes prepending, etc.).
+    #[allow(clippy::too_many_arguments)]
+    fn generate_codes(
+        &self,
+        gen_config: &generation::GenerationConfig,
+        sampling_ctx: &mut generation::SamplingContext,
+        kv_caches: &mut [KVCache],
+        mut offset: usize,
+        mut last_hidden: Tensor,
+        initial_logits: &Tensor,
+        trailing_text_hidden: &Tensor,
+        trailing_text_len: usize,
+        tts_pad_embed: &Tensor,
+    ) -> Result<FrameCodes> {
+        let mut generated_tokens: Vec<u32> = Vec::new();
+
+        // Sample first semantic token
+        let logits_2d = initial_logits.squeeze(1)?;
+        let logits_2d =
+            self.apply_generation_penalties(&logits_2d, &generated_tokens, gen_config, 0)?;
+        let first_token = generation::sample(&logits_2d, gen_config, sampling_ctx)?;
+        let mut semantic_token: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
+        generated_tokens.push(semantic_token);
+
+        let mut all_codes: FrameCodes = Vec::new();
+
+        for frame_idx in 0..gen_config.max_new_tokens {
+            if let Some(eos_id) = gen_config.eos_token_id {
+                if semantic_token == eos_id {
+                    break;
+                }
+            }
+
+            let semantic_embed = self.talker.get_codec_embedding(semantic_token)?;
+
+            let acoustic_codes = self
+                .code_predictor
+                .generate_acoustic_codes(&last_hidden, &semantic_embed)?;
+
+            let mut frame_codes = vec![semantic_token];
+            frame_codes.extend(&acoustic_codes);
+            all_codes.push(frame_codes);
+
+            let acoustic_embed_sum = self
+                .code_predictor
+                .get_acoustic_embeddings_sum(&acoustic_codes, &self.device)?;
+            let summed = semantic_embed.add(&acoustic_embed_sum)?;
+
+            let text_addition = if frame_idx < trailing_text_len {
+                trailing_text_hidden.i((.., frame_idx..frame_idx + 1, ..))?
+            } else {
+                tts_pad_embed.clone()
+            };
+            let step_input = summed.add(&text_addition)?;
+
+            let (h, new_logits) =
+                self.talker
+                    .generate_step_with_embed(&step_input, kv_caches, offset)?;
+            offset += 1;
+            last_hidden = h;
+
+            let logits_2d = new_logits.squeeze(1)?;
+            let logits_2d = self.apply_generation_penalties(
+                &logits_2d,
+                &generated_tokens,
+                gen_config,
+                generated_tokens.len(),
+            )?;
+            let next_token = generation::sample(&logits_2d, gen_config, sampling_ctx)?;
+            semantic_token = next_token.flatten_all()?.to_vec1::<u32>()?[0];
+            generated_tokens.push(semantic_token);
+        }
+
+        Ok(all_codes)
     }
 
     /// Synthesize speech with a specific voice and language.
@@ -510,29 +532,13 @@ impl Qwen3TTS {
         }
 
         let options = options.unwrap_or_default();
+        let mut sampling_ctx = generation::SamplingContext::new(options.seed);
         let input_ids = self.text_tokenizer.encode(text)?;
 
-        let gen_config = generation::GenerationConfig {
-            max_new_tokens: options.max_length,
-            temperature: options.temperature,
-            top_k: options.top_k,
-            top_p: options.top_p,
-            repetition_penalty: options.repetition_penalty,
-            eos_token_id: options.eos_token_id,
-            min_new_tokens: options.min_new_tokens,
-        };
+        let gen_config = options.to_gen_config();
 
-        // Build trailing text: remaining text tokens projected + tts_eos.
-        // After trailing text is exhausted, tts_pad is used for each subsequent step.
-        let trailing_text_hidden = if input_ids.len() > 1 {
-            let remaining_proj = self.talker.get_projected_text_embeddings(&input_ids[1..])?;
-            let tts_eos_embed = self.talker.get_tts_eos_embed()?;
-            Tensor::cat(&[&remaining_proj, &tts_eos_embed], 1)?
-        } else {
-            self.talker.get_tts_eos_embed()?
-        };
-        let trailing_text_len = trailing_text_hidden.dim(1)?;
-        let tts_pad_embed = self.talker.get_tts_pad_embed()?;
+        let (trailing_text_hidden, trailing_text_len, tts_pad_embed) =
+            self.build_trailing_text(&input_ids)?;
 
         // Prefill with CustomVoice format
         let mut kv_caches = self.talker.new_kv_caches();
@@ -540,82 +546,23 @@ impl Qwen3TTS {
             self.talker
                 .prefill_custom_voice(&input_ids, speaker, language, &mut kv_caches)?;
         let prefill_len = hidden.dim(1)?;
-        let mut offset = prefill_len;
-        let mut last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
+        let offset = prefill_len;
+        let last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
 
-        // Track generated tokens for repetition penalty
-        let mut generated_tokens: Vec<u32> = Vec::new();
-
-        // Sample first semantic token
-        let logits_2d = logits.squeeze(1)?;
-        let logits_2d =
-            self.apply_generation_penalties(&logits_2d, &generated_tokens, &gen_config, 0)?;
-        let first_token = generation::sample(&logits_2d, &gen_config)?;
-        let mut semantic_token: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
-        generated_tokens.push(semantic_token);
-
-        let mut all_codes: Vec<Vec<u32>> = Vec::new();
-
-        // Generation loop: semantic token → acoustic codes → residual VQ sum → trailing text → next step
-        for frame_idx in 0..gen_config.max_new_tokens {
-            // Check EOS
-            if let Some(eos_id) = gen_config.eos_token_id {
-                if semantic_token == eos_id {
-                    break;
-                }
-            }
-
-            let semantic_embed = self.talker.get_codec_embedding(semantic_token)?;
-
-            // Generate 15 acoustic codes autoregressively
-            let acoustic_codes = self
-                .code_predictor
-                .generate_acoustic_codes(&last_hidden, &semantic_embed)?;
-
-            // Save frame [semantic, acoustic_0..14]
-            let mut frame_codes = vec![semantic_token];
-            frame_codes.extend(&acoustic_codes);
-            all_codes.push(frame_codes);
-
-            // Build input for next talker step:
-            // sum all 16 code embeddings (residual VQ pattern)
-            let acoustic_embed_sum = self
-                .code_predictor
-                .get_acoustic_embeddings_sum(&acoustic_codes, &self.device)?;
-            let summed = semantic_embed.add(&acoustic_embed_sum)?;
-
-            // Add trailing text embedding (or tts_pad if exhausted)
-            let text_addition = if frame_idx < trailing_text_len {
-                trailing_text_hidden.i((.., frame_idx..frame_idx + 1, ..))?
-            } else {
-                tts_pad_embed.clone()
-            };
-            let step_input = summed.add(&text_addition)?;
-
-            // Run through talker to get next hidden state and logits
-            let (h, new_logits) =
-                self.talker
-                    .generate_step_with_embed(&step_input, &mut kv_caches, offset)?;
-            offset += 1;
-            last_hidden = h;
-
-            // Sample next semantic token with repetition penalty + token suppression + min_new_tokens
-            let logits_2d = new_logits.squeeze(1)?;
-            let logits_2d = self.apply_generation_penalties(
-                &logits_2d,
-                &generated_tokens,
-                &gen_config,
-                generated_tokens.len(),
-            )?;
-            let next_token = generation::sample(&logits_2d, &gen_config)?;
-            semantic_token = next_token.flatten_all()?.to_vec1::<u32>()?[0];
-            generated_tokens.push(semantic_token);
-        }
+        let all_codes = self.generate_codes(
+            &gen_config,
+            &mut sampling_ctx,
+            &mut kv_caches,
+            offset,
+            last_hidden,
+            &logits,
+            &trailing_text_hidden,
+            trailing_text_len,
+            &tts_pad_embed,
+        )?;
 
         // Decode to audio
-        let codes = self.codes_to_tensor(&all_codes)?;
-        let waveform = self.decoder.decode(&codes)?;
-        AudioBuffer::from_tensor(waveform, 24000)
+        self.decode_codes(&all_codes)
     }
 
     /// Synthesize speech using a text-described voice (VoiceDesign model).
@@ -652,32 +599,17 @@ impl Qwen3TTS {
         }
 
         let options = options.unwrap_or_default();
+        let mut sampling_ctx = generation::SamplingContext::new(options.seed);
         let input_ids = self.text_tokenizer.encode(text)?;
 
         // Tokenize instruct with ChatML user framing: <|im_start|>user\n{instruct}<|im_end|>\n
         let instruct_text = format!("<|im_start|>user\n{}<|im_end|>\n", instruct);
         let instruct_ids = self.text_tokenizer.encode(&instruct_text)?;
 
-        let gen_config = generation::GenerationConfig {
-            max_new_tokens: options.max_length,
-            temperature: options.temperature,
-            top_k: options.top_k,
-            top_p: options.top_p,
-            repetition_penalty: options.repetition_penalty,
-            eos_token_id: options.eos_token_id,
-            min_new_tokens: options.min_new_tokens,
-        };
+        let gen_config = options.to_gen_config();
 
-        // Build trailing text: remaining text tokens projected + tts_eos
-        let trailing_text_hidden = if input_ids.len() > 1 {
-            let remaining_proj = self.talker.get_projected_text_embeddings(&input_ids[1..])?;
-            let tts_eos_embed = self.talker.get_tts_eos_embed()?;
-            Tensor::cat(&[&remaining_proj, &tts_eos_embed], 1)?
-        } else {
-            self.talker.get_tts_eos_embed()?
-        };
-        let trailing_text_len = trailing_text_hidden.dim(1)?;
-        let tts_pad_embed = self.talker.get_tts_pad_embed()?;
+        let (trailing_text_hidden, trailing_text_len, tts_pad_embed) =
+            self.build_trailing_text(&input_ids)?;
 
         // Prefill with VoiceDesign format
         let mut kv_caches = self.talker.new_kv_caches();
@@ -688,101 +620,42 @@ impl Qwen3TTS {
             &mut kv_caches,
         )?;
         let prefill_len = hidden.dim(1)?;
-        let mut offset = prefill_len;
-        let mut last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
+        let offset = prefill_len;
+        let last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
 
-        // Track generated tokens for repetition penalty
-        let mut generated_tokens: Vec<u32> = Vec::new();
-
-        // Sample first semantic token
-        let logits_2d = logits.squeeze(1)?;
-        let logits_2d =
-            self.apply_generation_penalties(&logits_2d, &generated_tokens, &gen_config, 0)?;
-        let first_token = generation::sample(&logits_2d, &gen_config)?;
-        let mut semantic_token: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
-        generated_tokens.push(semantic_token);
-
-        let mut all_codes: Vec<Vec<u32>> = Vec::new();
-
-        // Generation loop: identical to synthesize_with_voice
-        for frame_idx in 0..gen_config.max_new_tokens {
-            if let Some(eos_id) = gen_config.eos_token_id {
-                if semantic_token == eos_id {
-                    break;
-                }
-            }
-
-            let semantic_embed = self.talker.get_codec_embedding(semantic_token)?;
-
-            let acoustic_codes = self
-                .code_predictor
-                .generate_acoustic_codes(&last_hidden, &semantic_embed)?;
-
-            let mut frame_codes = vec![semantic_token];
-            frame_codes.extend(&acoustic_codes);
-            all_codes.push(frame_codes);
-
-            let acoustic_embed_sum = self
-                .code_predictor
-                .get_acoustic_embeddings_sum(&acoustic_codes, &self.device)?;
-            let summed = semantic_embed.add(&acoustic_embed_sum)?;
-
-            let text_addition = if frame_idx < trailing_text_len {
-                trailing_text_hidden.i((.., frame_idx..frame_idx + 1, ..))?
-            } else {
-                tts_pad_embed.clone()
-            };
-            let step_input = summed.add(&text_addition)?;
-
-            let (h, new_logits) =
-                self.talker
-                    .generate_step_with_embed(&step_input, &mut kv_caches, offset)?;
-            offset += 1;
-            last_hidden = h;
-
-            let logits_2d = new_logits.squeeze(1)?;
-            let logits_2d = self.apply_generation_penalties(
-                &logits_2d,
-                &generated_tokens,
-                &gen_config,
-                generated_tokens.len(),
-            )?;
-            let next_token = generation::sample(&logits_2d, &gen_config)?;
-            semantic_token = next_token.flatten_all()?.to_vec1::<u32>()?[0];
-            generated_tokens.push(semantic_token);
-        }
+        let all_codes = self.generate_codes(
+            &gen_config,
+            &mut sampling_ctx,
+            &mut kv_caches,
+            offset,
+            last_hidden,
+            &logits,
+            &trailing_text_hidden,
+            trailing_text_len,
+            &tts_pad_embed,
+        )?;
 
         // Decode to audio
-        let codes = self.codes_to_tensor(&all_codes)?;
-        let waveform = self.decoder.decode(&codes)?;
-        AudioBuffer::from_tensor(waveform, 24000)
+        self.decode_codes(&all_codes)
     }
 
     /// Convert list of frame codes to tensor [batch, 16, num_frames]
     pub fn codes_to_tensor(&self, codes: &[Vec<u32>]) -> Result<Tensor> {
-        let num_frames = codes.len();
-        if num_frames == 0 {
-            return Ok(Tensor::zeros((1, 16, 0), DType::I64, &self.device)?);
-        }
-
-        let mut data = vec![0i64; 16 * num_frames];
-        for (frame, frame_codes) in codes.iter().enumerate() {
-            for (q, &code) in frame_codes.iter().enumerate() {
-                // Layout: [q0_f0, q0_f1, ...], [q1_f0, q1_f1, ...], ...
-                data[q * num_frames + frame] = code as i64;
-            }
-        }
-
-        Ok(Tensor::from_vec(data, (1, 16, num_frames), &self.device)?)
+        codes_to_tensor(codes, &self.device)
     }
 
     /// Decode raw frame codes to audio.
     ///
     /// Takes a slice of frames (each frame is a `Vec<u32>` of 16 codebook values)
-    /// and runs the 12Hz decoder to produce an audio waveform.
+    /// and runs the 12Hz decoder to produce an audio waveform at 24kHz.
     pub fn decode_codes(&self, codes: &[Vec<u32>]) -> Result<AudioBuffer> {
         let tensor = self.codes_to_tensor(codes)?;
-        let waveform = self.decoder.decode(&tensor)?;
+        self.decode_tensor(&tensor)
+    }
+
+    /// Decode a codes tensor `[1, 16, T]` to audio.
+    fn decode_tensor(&self, codes: &Tensor) -> Result<AudioBuffer> {
+        let waveform = self.decoder.decode(codes)?;
         AudioBuffer::from_tensor(waveform, 24000)
     }
 
@@ -797,8 +670,9 @@ impl Qwen3TTS {
         prompt: &VoiceClonePrompt,
         language: Language,
         options: Option<SynthesisOptions>,
-    ) -> Result<(AudioBuffer, Vec<Vec<u32>>)> {
+    ) -> Result<(AudioBuffer, FrameCodes)> {
         let options = options.unwrap_or_default();
+        let mut sampling_ctx = generation::SamplingContext::new(options.seed);
         let input_ids = self.text_tokenizer.encode(text)?;
 
         // Determine if ICL mode is active (ref_codes + ref_text present)
@@ -806,24 +680,20 @@ impl Qwen3TTS {
 
         // ICL mode adjustments (matching mlx-audio):
         let repetition_penalty = if is_icl {
-            options.repetition_penalty.max(1.5)
+            options.repetition_penalty.max(ICL_MIN_REPETITION_PENALTY)
         } else {
             options.repetition_penalty
         };
         let max_new_tokens = if is_icl {
-            options.max_length.min(75.max(input_ids.len() * 6))
+            options
+                .max_length
+                .min(ICL_MIN_FRAMES.max(input_ids.len() * ICL_FRAMES_PER_TOKEN))
         } else {
             options.max_length
         };
-        let gen_config = generation::GenerationConfig {
-            max_new_tokens,
-            temperature: options.temperature,
-            top_k: options.top_k,
-            top_p: options.top_p,
-            repetition_penalty,
-            eos_token_id: options.eos_token_id,
-            min_new_tokens: options.min_new_tokens,
-        };
+        let mut gen_config = options.to_gen_config();
+        gen_config.max_new_tokens = max_new_tokens;
+        gen_config.repetition_penalty = repetition_penalty;
 
         // Cast speaker embedding to compute dtype (speaker encoder produces F32)
         let speaker_embed = prompt.speaker_embedding.to_dtype(self.compute_dtype)?;
@@ -859,14 +729,7 @@ impl Qwen3TTS {
 
             let icl_len = icl_embed.dim(1)?;
             if icl_len > 0 {
-                let mut mask_data = vec![0.0f32; icl_len * (offset + icl_len)];
-                for i in 0..icl_len {
-                    for j in (offset + i + 1)..(offset + icl_len) {
-                        mask_data[i * (offset + icl_len) + j] = f32::NEG_INFINITY;
-                    }
-                }
-                let mask =
-                    Tensor::from_vec(mask_data, (1, 1, icl_len, offset + icl_len), &self.device)?;
+                let mask = models::transformer::create_causal_mask(icl_len, offset, &self.device)?;
 
                 let mut icl_hidden = icl_embed;
                 for (i, layer) in self.talker.layers_iter().enumerate() {
@@ -901,67 +764,17 @@ impl Qwen3TTS {
         let trailing_text_len = trailing_text_hidden.dim(1)?;
         let tts_pad_embed = self.talker.get_tts_pad_embed()?;
 
-        // Track generated tokens for repetition penalty
-        let mut generated_tokens: Vec<u32> = Vec::new();
-
-        // Sample first semantic token
-        let logits_2d = logits.squeeze(1)?;
-        let logits_2d =
-            self.apply_generation_penalties(&logits_2d, &generated_tokens, &gen_config, 0)?;
-        let first_token = generation::sample(&logits_2d, &gen_config)?;
-        let mut semantic_token: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
-        generated_tokens.push(semantic_token);
-
-        let mut all_codes: Vec<Vec<u32>> = Vec::new();
-
-        // Generation loop
-        for frame_idx in 0..gen_config.max_new_tokens {
-            if let Some(eos_id) = gen_config.eos_token_id {
-                if semantic_token == eos_id {
-                    break;
-                }
-            }
-
-            let semantic_embed = self.talker.get_codec_embedding(semantic_token)?;
-
-            let acoustic_codes = self
-                .code_predictor
-                .generate_acoustic_codes(&last_hidden, &semantic_embed)?;
-
-            let mut frame_codes = vec![semantic_token];
-            frame_codes.extend(&acoustic_codes);
-            all_codes.push(frame_codes);
-
-            let acoustic_embed_sum = self
-                .code_predictor
-                .get_acoustic_embeddings_sum(&acoustic_codes, &self.device)?;
-            let summed = semantic_embed.add(&acoustic_embed_sum)?;
-
-            let text_addition = if frame_idx < trailing_text_len {
-                trailing_text_hidden.i((.., frame_idx..frame_idx + 1, ..))?
-            } else {
-                tts_pad_embed.clone()
-            };
-            let step_input = summed.add(&text_addition)?;
-
-            let (h, new_logits) =
-                self.talker
-                    .generate_step_with_embed(&step_input, &mut kv_caches, offset)?;
-            offset += 1;
-            last_hidden = h;
-
-            // Sample next semantic token with repetition penalty + token suppression + min_new_tokens
-            let logits_2d = new_logits.squeeze(1)?;
-            let logits_2d = self.apply_generation_penalties(
-                &logits_2d,
-                &generated_tokens,
-                &gen_config,
-                generated_tokens.len(),
-            )?;
-            let next_token = generation::sample(&logits_2d, &gen_config)?;
-            semantic_token = next_token.flatten_all()?.to_vec1::<u32>()?[0];
-            generated_tokens.push(semantic_token);
-        }
+        let all_codes = self.generate_codes(
+            &gen_config,
+            &mut sampling_ctx,
+            &mut kv_caches,
+            offset,
+            last_hidden,
+            &logits,
+            &trailing_text_hidden,
+            trailing_text_len,
+            &tts_pad_embed,
+        )?;
 
         // Prepend ref_codes for ICL decoder context (same fix as synthesize_voice_clone)
         let audio = if let Some(ref_codes) = &prompt.ref_codes {
@@ -971,16 +784,12 @@ impl Qwen3TTS {
             combined.extend(all_codes.iter().cloned());
             let total_len = combined.len();
 
-            let codes = self.codes_to_tensor(&combined)?;
-            let waveform = self.decoder.decode(&codes)?;
-            let mut audio = AudioBuffer::from_tensor(waveform, 24000)?;
+            let mut audio = self.decode_codes(&combined)?;
             let cut_samples = ref_len * audio.len() / total_len;
             audio.samples = audio.samples[cut_samples..].to_vec();
             audio
         } else {
-            let codes = self.codes_to_tensor(&all_codes)?;
-            let waveform = self.decoder.decode(&codes)?;
-            AudioBuffer::from_tensor(waveform, 24000)?
+            self.decode_codes(&all_codes)?
         };
         Ok((audio, all_codes))
     }
@@ -1093,207 +902,12 @@ impl Qwen3TTS {
         language: Language,
         options: Option<SynthesisOptions>,
     ) -> Result<AudioBuffer> {
-        let options = options.unwrap_or_default();
-        let input_ids = self.text_tokenizer.encode(text)?;
-
-        // Determine if ICL mode is active (ref_codes + ref_text present)
-        let is_icl = prompt.ref_codes.is_some() && prompt.ref_text_ids.is_some();
-
-        // ICL mode adjustments (matching mlx-audio):
-        // - Stronger repetition penalty (min 1.5) to prevent degenerate loops
-        // - Cap max tokens proportional to text length to prevent runaway generation
-        let repetition_penalty = if is_icl {
-            options.repetition_penalty.max(1.5)
-        } else {
-            options.repetition_penalty
-        };
-        let max_new_tokens = if is_icl {
-            options.max_length.min(75.max(input_ids.len() * 6))
-        } else {
-            options.max_length
-        };
-        let gen_config = generation::GenerationConfig {
-            max_new_tokens,
-            temperature: options.temperature,
-            top_k: options.top_k,
-            top_p: options.top_p,
-            repetition_penalty,
-            eos_token_id: options.eos_token_id,
-            min_new_tokens: options.min_new_tokens,
-        };
-
-        // Cast speaker embedding to compute dtype (speaker encoder produces F32)
-        let speaker_embed = prompt.speaker_embedding.to_dtype(self.compute_dtype)?;
-
-        // Voice clone prefill (9 positions for ICL, 10 for x_vector_only)
-        let mut kv_caches = self.talker.new_kv_caches();
-        let (hidden, logits) = self.talker.prefill_voice_clone(
-            &input_ids,
-            &speaker_embed,
-            language,
-            is_icl,
-            &mut kv_caches,
-        )?;
-        let prefill_len = hidden.dim(1)?;
-        let mut offset = prefill_len;
-
-        // Initialize last_hidden from prefill; updated by ICL block if active.
-        // The code predictor uses this to condition acoustic code generation —
-        // it must come from the position that produced the first semantic logits.
-        let mut last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
-
-        // ── ICL extension (if reference codes + text are provided) ──────────
-        let (trailing_text_hidden, logits) = if let (Some(ref_codes), Some(ref_text_ids)) =
-            (&prompt.ref_codes, &prompt.ref_text_ids)
-        {
-            // Sum reference codec embeddings across all 16 codebook groups
-            let ref_codec_embeds = self.sum_ref_codec_embeddings(ref_codes)?;
-
-            // In ICL mode, all text tokens go into the ICL prompt (Python:
-            // text_id=input_id[:, 3:-5] passes ALL target text tokens).
-            let (icl_embed, icl_trailing) =
-                self.talker
-                    .build_icl_prompt(&input_ids, ref_text_ids, &ref_codec_embeds, false)?;
-
-            // Feed ICL embeddings through the model to extend the KV cache.
-            // Process in a single pass (no generation, just context extension).
-            let icl_len = icl_embed.dim(1)?;
-            if icl_len > 0 {
-                // Create causal mask for ICL tokens
-                let mut mask_data = vec![0.0f32; icl_len * (offset + icl_len)];
-                for i in 0..icl_len {
-                    for j in (offset + i + 1)..(offset + icl_len) {
-                        mask_data[i * (offset + icl_len) + j] = f32::NEG_INFINITY;
-                    }
-                }
-                let mask =
-                    Tensor::from_vec(mask_data, (1, 1, icl_len, offset + icl_len), &self.device)?;
-
-                let mut icl_hidden = icl_embed;
-                for (i, layer) in self.talker.layers_iter().enumerate() {
-                    icl_hidden = layer.forward(
-                        &icl_hidden,
-                        self.talker.rope(),
-                        Some(&mask),
-                        Some(&mut kv_caches[i]),
-                        offset,
-                    )?;
-                }
-                icl_hidden = self.talker.apply_norm(&icl_hidden)?;
-                offset += icl_len;
-
-                // Get logits from last ICL position (replaces prefill logits)
-                let last_icl_hidden = icl_hidden.i((.., icl_len - 1..icl_len, ..))?;
-                let new_logits = self.talker.apply_codec_head(&last_icl_hidden)?;
-
-                // Update last_hidden so the code predictor is conditioned on
-                // the ICL context, not the stale prefill hidden state.
-                last_hidden = last_icl_hidden;
-
-                (icl_trailing, new_logits)
-            } else {
-                // No ICL content, fall back to default trailing text
-                let trailing = self.build_default_trailing_text(&input_ids)?;
-                (trailing, logits)
-            }
-        } else {
-            // No ICL data — use default trailing text
-            let trailing = self.build_default_trailing_text(&input_ids)?;
-            (trailing, logits)
-        };
-
-        let trailing_text_len = trailing_text_hidden.dim(1)?;
-        let tts_pad_embed = self.talker.get_tts_pad_embed()?;
-
-        // Track generated tokens for repetition penalty
-        let mut generated_tokens: Vec<u32> = Vec::new();
-
-        // Sample first semantic token
-        let logits_2d = logits.squeeze(1)?;
-        let logits_2d =
-            self.apply_generation_penalties(&logits_2d, &generated_tokens, &gen_config, 0)?;
-        let first_token = generation::sample(&logits_2d, &gen_config)?;
-        let mut semantic_token: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
-        generated_tokens.push(semantic_token);
-
-        let mut all_codes: Vec<Vec<u32>> = Vec::new();
-
-        // Generation loop
-        for frame_idx in 0..gen_config.max_new_tokens {
-            if let Some(eos_id) = gen_config.eos_token_id {
-                if semantic_token == eos_id {
-                    break;
-                }
-            }
-
-            let semantic_embed = self.talker.get_codec_embedding(semantic_token)?;
-
-            let acoustic_codes = self
-                .code_predictor
-                .generate_acoustic_codes(&last_hidden, &semantic_embed)?;
-
-            let mut frame_codes = vec![semantic_token];
-            frame_codes.extend(&acoustic_codes);
-            all_codes.push(frame_codes);
-
-            let acoustic_embed_sum = self
-                .code_predictor
-                .get_acoustic_embeddings_sum(&acoustic_codes, &self.device)?;
-            let summed = semantic_embed.add(&acoustic_embed_sum)?;
-
-            let text_addition = if frame_idx < trailing_text_len {
-                trailing_text_hidden.i((.., frame_idx..frame_idx + 1, ..))?
-            } else {
-                tts_pad_embed.clone()
-            };
-            let step_input = summed.add(&text_addition)?;
-
-            let (h, new_logits) =
-                self.talker
-                    .generate_step_with_embed(&step_input, &mut kv_caches, offset)?;
-            offset += 1;
-            last_hidden = h;
-
-            // Sample next semantic token with repetition penalty + token suppression + min_new_tokens
-            let logits_2d = new_logits.squeeze(1)?;
-            let logits_2d = self.apply_generation_penalties(
-                &logits_2d,
-                &generated_tokens,
-                &gen_config,
-                generated_tokens.len(),
-            )?;
-            let next_token = generation::sample(&logits_2d, &gen_config)?;
-            semantic_token = next_token.flatten_all()?.to_vec1::<u32>()?[0];
-            generated_tokens.push(semantic_token);
-        }
-
-        // For ICL mode, the decoder needs reference codes as causal context.
-        // Prepend ref_codes to generated codes before decoding, then trim
-        // the reference audio from the output (matching Python behavior).
-        if let Some(ref_codes) = &prompt.ref_codes {
-            let ref_frames = self.tensor_to_frame_codes(ref_codes)?;
-            let ref_len = ref_frames.len();
-            let mut combined = ref_frames;
-            combined.extend(all_codes);
-            let total_len = combined.len();
-
-            let codes = self.codes_to_tensor(&combined)?;
-            let waveform = self.decoder.decode(&codes)?;
-            let mut audio = AudioBuffer::from_tensor(waveform, 24000)?;
-
-            // Trim the reference audio portion (proportional, like Python)
-            let cut_samples = ref_len * audio.len() / total_len;
-            audio.samples = audio.samples[cut_samples..].to_vec();
-            Ok(audio)
-        } else {
-            let codes = self.codes_to_tensor(&all_codes)?;
-            let waveform = self.decoder.decode(&codes)?;
-            AudioBuffer::from_tensor(waveform, 24000)
-        }
+        self.synthesize_voice_clone_debug(text, prompt, language, options)
+            .map(|(audio, _codes)| audio)
     }
 
     /// Convert a ref_codes tensor `[T_frames, 16]` to `Vec<Vec<u32>>` frame format.
-    fn tensor_to_frame_codes(&self, codes: &Tensor) -> Result<Vec<Vec<u32>>> {
+    fn tensor_to_frame_codes(&self, codes: &Tensor) -> Result<FrameCodes> {
         let (n_frames, n_codebooks) = codes.dims2()?;
         let codes_u32 = codes.to_dtype(DType::U32)?;
         let mut frames = Vec::with_capacity(n_frames);
@@ -1340,20 +954,15 @@ impl Qwen3TTS {
 
     /// Build default trailing text embeddings (for non-ICL mode).
     fn build_default_trailing_text(&self, input_ids: &[u32]) -> Result<Tensor> {
-        if input_ids.len() > 1 {
-            let remaining_proj = self.talker.get_projected_text_embeddings(&input_ids[1..])?;
-            let tts_eos_embed = self.talker.get_tts_eos_embed()?;
-            Ok(Tensor::cat(&[&remaining_proj, &tts_eos_embed], 1)?)
-        } else {
-            self.talker.get_tts_eos_embed()
-        }
+        let (hidden, _len, _pad) = self.build_trailing_text(input_ids)?;
+        Ok(hidden)
     }
 
     /// Apply repetition penalty, token suppression, and min_new_tokens EOS suppression.
     ///
     /// This is the standard logit processing pipeline matching Python/HuggingFace order:
     /// 1. Repetition penalty (penalize previously generated tokens)
-    /// 2. Token suppression (mask reserved control tokens [2048, 3072) except EOS)
+    /// 2. Token suppression (mask reserved control tokens except EOS)
     /// 3. Min new tokens (suppress EOS if fewer than min_new_tokens have been generated)
     fn apply_generation_penalties(
         &self,
@@ -1370,11 +979,15 @@ impl Qwen3TTS {
             let prev = Tensor::new(generated_tokens, &self.device)?;
             generation::apply_repetition_penalty(&logits, &prev, config.repetition_penalty)?
         } else {
-            logits.clone()
+            logits
         };
 
         // 2. Token suppression
-        let logits = generation::apply_token_suppression(&logits, 3072, CODEC_EOS_TOKEN_ID)?;
+        let logits = generation::apply_token_suppression(
+            &logits,
+            codec_tokens::CODEC_VOCAB_SIZE,
+            CODEC_EOS_TOKEN_ID,
+        )?;
 
         // 3. Min new tokens: suppress EOS if we haven't generated enough tokens yet
         if token_count < config.min_new_tokens {
@@ -1394,11 +1007,6 @@ impl Qwen3TTS {
         }
 
         Ok(logits)
-    }
-
-    /// Returns `true` if a speaker encoder is loaded (voice cloning is available).
-    pub fn has_speaker_encoder(&self) -> bool {
-        self.speaker_encoder.is_some()
     }
 
     /// Returns `true` if a speech encoder is loaded (ICL voice cloning is available).
@@ -1472,34 +1080,72 @@ impl Qwen3TTS {
     /// Tensors are loaded in their native dtype (typically BF16 for Qwen3-TTS).
     /// Each component's VarBuilder handles casting to its target dtype.
     fn load_weights(path: &Path, device: &Device) -> Result<HashMap<String, Tensor>> {
-        let tensors: HashMap<String, Tensor> = candle_core::safetensors::load(path, device)?;
-        Ok(tensors)
+        Ok(candle_core::safetensors::load(path, device)?)
     }
 
-    /// Filter weights by prefix, removing the prefix from keys
-    fn filter_weights(weights: &HashMap<String, Tensor>, prefix: &str) -> HashMap<String, Tensor> {
+    /// Filter weights by prefix, removing the prefix from keys.
+    pub(crate) fn filter_weights(
+        weights: &HashMap<String, Tensor>,
+        prefix: &str,
+    ) -> HashMap<String, Tensor> {
         weights
             .iter()
             .filter_map(|(k, v)| {
-                if k.starts_with(prefix) {
-                    Some((k.strip_prefix(prefix).unwrap().to_string(), v.clone()))
-                } else {
-                    None
-                }
+                k.strip_prefix(prefix)
+                    .map(|stripped| (stripped.to_string(), v.clone()))
             })
             .collect()
     }
 }
 
-/// Audio end-of-sequence token ID for Qwen3-TTS
-/// Codec EOS token ID — signals end of speech generation.
+/// Convert a slice of codec frames into a tensor of shape `[1, 16, T]`.
 ///
-/// This is in the codec vocabulary [0, 3072), not the text vocabulary.
-/// Value comes from model config: `talker_config.codec_eos_token_id`.
-pub const CODEC_EOS_TOKEN_ID: u32 = 2150;
+/// Each frame must contain exactly 16 codebook values. The output layout is
+/// `[q0_f0, q0_f1, ...], [q1_f0, q1_f1, ...]` matching the decoder's expectation.
+pub fn codes_to_tensor(codes: &[Vec<u32>], device: &Device) -> Result<Tensor> {
+    let num_frames = codes.len();
+    if num_frames == 0 {
+        return Ok(Tensor::zeros((1, 16, 0), DType::I64, device)?);
+    }
 
-/// Samples per frame at 24kHz with 12.5 Hz frame rate
+    let mut data = vec![0i64; 16 * num_frames];
+    for (frame, frame_codes) in codes.iter().enumerate() {
+        for (q, &code) in frame_codes.iter().enumerate() {
+            data[q * num_frames + frame] = code as i64;
+        }
+    }
+
+    Ok(Tensor::from_vec(data, (1, 16, num_frames), device)?)
+}
+
+/// Return the recommended compute dtype for the given device.
+///
+/// Returns `BF16` for CUDA/Metal (lower memory, faster attention) and `F32` for CPU.
+pub fn compute_dtype_for_device(device: &Device) -> DType {
+    if device.is_cuda() || device.is_metal() {
+        DType::BF16
+    } else {
+        DType::F32
+    }
+}
+
+/// The codec end-of-sequence token ID (2150).
+///
+/// Generation stops when this token is sampled. This is in the codec vocabulary
+/// `[0, 3072)`, not the text vocabulary.
+pub const CODEC_EOS_TOKEN_ID: u32 = codec_tokens::CODEC_EOS;
+
+/// Number of audio samples per codec frame at 24kHz (1920 = 80ms per frame at 12Hz).
 pub const SAMPLES_PER_FRAME: usize = 1920;
+
+/// ICL mode: minimum frames to generate regardless of text length (matching mlx-audio)
+const ICL_MIN_FRAMES: usize = 75;
+
+/// ICL mode: estimated frames per input text token for max-length cap (matching mlx-audio)
+const ICL_FRAMES_PER_TOKEN: usize = 6;
+
+/// ICL mode: minimum repetition penalty to prevent degenerate loops (matching mlx-audio)
+const ICL_MIN_REPETITION_PENALTY: f64 = 1.5;
 
 /// Streaming synthesis session.
 ///
@@ -1508,12 +1154,13 @@ pub const SAMPLES_PER_FRAME: usize = 1920;
 pub struct StreamingSession<'a> {
     model: &'a Qwen3TTS,
     config: generation::GenerationConfig,
+    sampling_ctx: generation::SamplingContext,
     kv_caches: Vec<KVCache>,
     offset: usize,
     last_hidden: Tensor,
     current_token: Option<u32>,
     frames_generated: usize,
-    frame_buffer: Vec<Vec<u32>>,
+    frame_buffer: FrameCodes,
     chunk_frames: usize,
     done: bool,
     // Trailing text state for residual VQ + text fusion
@@ -1532,28 +1179,11 @@ impl<'a> StreamingSession<'a> {
         language: Language,
         options: SynthesisOptions,
     ) -> Result<Self> {
-        let config = generation::GenerationConfig {
-            max_new_tokens: options.max_length,
-            temperature: options.temperature,
-            top_k: options.top_k,
-            top_p: options.top_p,
-            repetition_penalty: options.repetition_penalty,
-            eos_token_id: options.eos_token_id,
-            min_new_tokens: options.min_new_tokens,
-        };
+        let mut sampling_ctx = generation::SamplingContext::new(options.seed);
+        let config = options.to_gen_config();
 
-        // Build trailing text embeddings
-        let trailing_text_hidden = if input_ids.len() > 1 {
-            let remaining_proj = model
-                .talker
-                .get_projected_text_embeddings(&input_ids[1..])?;
-            let tts_eos_embed = model.talker.get_tts_eos_embed()?;
-            Tensor::cat(&[&remaining_proj, &tts_eos_embed], 1)?
-        } else {
-            model.talker.get_tts_eos_embed()?
-        };
-        let trailing_text_len = trailing_text_hidden.dim(1)?;
-        let tts_pad_embed = model.talker.get_tts_pad_embed()?;
+        let (trailing_text_hidden, trailing_text_len, tts_pad_embed) =
+            model.build_trailing_text(input_ids)?;
 
         // Prefill with CustomVoice format
         let mut kv_caches = model.talker.new_kv_caches();
@@ -1569,7 +1199,7 @@ impl<'a> StreamingSession<'a> {
         let logits_2d = logits.squeeze(1)?;
         let logits_2d =
             model.apply_generation_penalties(&logits_2d, &generated_tokens, &config, 0)?;
-        let first_token = generation::sample(&logits_2d, &config)?;
+        let first_token = generation::sample(&logits_2d, &config, &mut sampling_ctx)?;
         let first_token_id: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
         generated_tokens.push(first_token_id);
 
@@ -1578,6 +1208,7 @@ impl<'a> StreamingSession<'a> {
         Ok(Self {
             model,
             config,
+            sampling_ctx,
             kv_caches,
             offset: prefill_len,
             last_hidden,
@@ -1667,7 +1298,7 @@ impl<'a> StreamingSession<'a> {
                 &self.config,
                 self.generated_tokens.len(),
             )?;
-            let next_token = generation::sample(&logits_2d, &self.config)?;
+            let next_token = generation::sample(&logits_2d, &self.config, &mut self.sampling_ctx)?;
             let next_token_id: u32 = next_token.flatten_all()?.to_vec1::<u32>()?[0];
             self.generated_tokens.push(next_token_id);
 
@@ -1732,6 +1363,23 @@ pub struct SynthesisOptions {
     pub chunk_frames: usize,
     /// Minimum tokens before EOS is allowed (default: 2, matching Python)
     pub min_new_tokens: usize,
+    /// Random seed for deterministic generation. `None` = non-deterministic.
+    pub seed: Option<u64>,
+}
+
+impl SynthesisOptions {
+    /// Convert to a [`GenerationConfig`](generation::GenerationConfig) for the generation loop.
+    pub fn to_gen_config(&self) -> generation::GenerationConfig {
+        generation::GenerationConfig {
+            max_new_tokens: self.max_length,
+            temperature: self.temperature,
+            top_k: self.top_k,
+            top_p: self.top_p,
+            repetition_penalty: self.repetition_penalty,
+            eos_token_id: self.eos_token_id,
+            min_new_tokens: self.min_new_tokens,
+        }
+    }
 }
 
 impl Default for SynthesisOptions {
@@ -1745,6 +1393,7 @@ impl Default for SynthesisOptions {
             eos_token_id: Some(CODEC_EOS_TOKEN_ID),
             chunk_frames: 10, // ~800ms per chunk at 12.5 Hz
             min_new_tokens: 2,
+            seed: None,
         }
     }
 }
@@ -1876,6 +1525,7 @@ mod tests {
             eos_token_id: Some(CODEC_EOS_TOKEN_ID),
             chunk_frames: 5,
             min_new_tokens: 0,
+            seed: Some(42),
         };
         assert_eq!(options.max_length, 512);
         assert!((options.temperature - 0.5).abs() < 1e-6);
@@ -1923,5 +1573,82 @@ mod tests {
         // Verify config re-export works
         let config = Qwen3TTSConfig::default();
         assert_eq!(config.model_type, "qwen3_tts");
+    }
+
+    #[test]
+    fn test_codes_to_tensor_empty() {
+        let device = Device::Cpu;
+        let codes: Vec<Vec<u32>> = vec![];
+        let tensor = codes_to_tensor(&codes, &device).unwrap();
+        assert_eq!(tensor.dims(), &[1, 16, 0]);
+    }
+
+    #[test]
+    fn test_codes_to_tensor_single_frame() {
+        let device = Device::Cpu;
+        let codes = vec![vec![0u32; 16]];
+        let tensor = codes_to_tensor(&codes, &device).unwrap();
+        assert_eq!(tensor.dims(), &[1, 16, 1]);
+    }
+
+    #[test]
+    fn test_codes_to_tensor_layout() {
+        let device = Device::Cpu;
+        // 2 frames, each with 16 codebooks
+        let codes = vec![
+            (0..16).map(|i| i as u32).collect::<Vec<_>>(), // frame 0
+            (100..116).map(|i| i as u32).collect::<Vec<_>>(), // frame 1
+        ];
+        let tensor = codes_to_tensor(&codes, &device).unwrap();
+        assert_eq!(tensor.dims(), &[1, 16, 2]);
+
+        // Verify layout: tensor[0, q, frame] = codes[frame][q]
+        let vals: Vec<i64> = tensor.flatten_all().unwrap().to_vec1().unwrap();
+        // q=0: [frame0_q0, frame1_q0] = [0, 100]
+        assert_eq!(vals[0], 0);
+        assert_eq!(vals[1], 100);
+        // q=1: [frame0_q1, frame1_q1] = [1, 101]
+        assert_eq!(vals[2], 1);
+        assert_eq!(vals[3], 101);
+    }
+
+    #[test]
+    fn test_parse_device_cpu() {
+        let device = parse_device("cpu").unwrap();
+        assert!(matches!(device, Device::Cpu));
+    }
+
+    #[test]
+    fn test_parse_device_auto() {
+        let device = parse_device("auto").unwrap();
+        // Should succeed regardless of hardware
+        assert!(
+            matches!(device, Device::Cpu)
+                || matches!(device, Device::Cuda(_))
+                || matches!(device, Device::Metal(_))
+        );
+    }
+
+    #[test]
+    fn test_parse_device_unknown() {
+        let result = parse_device("tpu");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_device_case_insensitive() {
+        let device = parse_device("CPU").unwrap();
+        assert!(matches!(device, Device::Cpu));
+    }
+
+    #[test]
+    fn test_device_info() {
+        assert_eq!(device_info(&Device::Cpu), "CPU");
+    }
+
+    #[test]
+    fn test_compute_dtype_for_device() {
+        let dtype = compute_dtype_for_device(&Device::Cpu);
+        assert_eq!(dtype, DType::F32);
     }
 }

@@ -50,12 +50,14 @@ Tested on NVIDIA GB10 (bf16 + flash-attn) with seed=42, duration=3.0s, text="Hel
 ## Recent Changes
 
 ### Runtime flash-attn fallback
+
 - Changed flash-attn from compile-time `#[cfg]` gate to runtime `device.is_cuda()` check
 - Same binary now works on both CPU (standard attention) and CUDA (flash attention 2)
 - Removed `#[allow(dead_code)]` from `repeat_kv` since it's always reachable now
 - 20/20 variant tests pass (10 CPU + 10 CUDA, all 5 models)
 
 ### Full bf16 + Flash Attention 2 pipeline
+
 - Added `compute_dtype` field to `Qwen3TTS` — BF16 on CUDA, F32 on CPU
 - Talker and code predictor now run entirely in bf16 on CUDA, matching the official Python recommendation (`dtype=torch.bfloat16, attn_implementation="flash_attention_2"`)
 - Codec decoder and speaker encoder remain in F32 (convolutional, no attention)
@@ -64,6 +66,7 @@ Tested on NVIDIA GB10 (bf16 + flash-attn) with seed=42, duration=3.0s, text="Hel
 - Validated on NVIDIA GB10 (Grace Blackwell, aarch64) in NGC container: clippy clean, 170 tests pass, 1.7B ICL inference produces intelligible speech
 
 ### Deep cleanup pass: VarBuilder conversion & dead code removal
+
 - Converted `TalkerModel` from raw `HashMap<String, Tensor>` lookups to `VarBuilder` + typed candle_nn layers (`Embedding`, `Linear`, `RmsNorm`, `DecoderLayer`)
 - Deleted `TalkerDecoderLayer` (~240 lines) — now reuses `DecoderLayer` from `transformer.rs`
 - Moved `RoPEType` enum to `transformer.rs`, updated `DecoderLayer::forward()` and `CodePredictor` to use it
@@ -75,6 +78,7 @@ Tested on NVIDIA GB10 (bf16 + flash-attn) with seed=42, duration=3.0s, text="Hel
 - Fixed README streaming example and CLI tools section
 
 ### Dead code cleanup & public API wiring
+
 - Deleted stale binaries: `main.rs`, `tts_generate.rs`, `custom_voice_tts.rs`
 - Renamed `qwen3_tts.rs` → `transformer.rs` (shared building blocks only)
 - Removed dead `Qwen3TTSModel` struct (superseded by `TalkerModel`)
@@ -89,18 +93,21 @@ Tested on NVIDIA GB10 (bf16 + flash-attn) with seed=42, duration=3.0s, text="Hel
 ## Features
 
 ### Core TTS Pipeline
+
 - Text → TalkerModel → semantic tokens (CustomVoice prefill + autoregressive)
 - Per-frame: semantic embed → CodePredictor → 15 acoustic codes
 - Residual VQ sum + trailing text → next talker step
 - All 16 codebook codes → Decoder12Hz → 24kHz audio
 
 ### API Features
+
 - `Qwen3TTS::synthesize()` - Simple text-to-speech (Ryan/English defaults)
 - `Qwen3TTS::synthesize_with_voice()` - CustomVoice speaker + language selection
 - `Qwen3TTS::synthesize_streaming()` - Low-latency streaming with voice selection
 - `ModelPaths::download()` - HuggingFace Hub integration
 
 ### Hardware Support
+
 - CPU (default, F32)
 - CUDA (feature flag, auto bf16 for transformer components)
 - CUDA + Flash Attention 2 (`flash-attn` feature, requires CUDA toolkit)
@@ -156,15 +163,19 @@ tests/
 ## Key Implementation Notes
 
 ### CausalTransConv1d Trimming
+
 Trim from right side only for exact `input * stride` output:
+
 ```rust
 let right_trim = kernel_size.saturating_sub(stride);
 let left_trim = 0;  // NOT kernel_size / 2
 ```
 
 ### Linear for 3D Tensors
+
 Candle's `candle_nn::Linear` handles 3D inputs natively. For modules still using raw
 weight tensors (e.g. `Decoder12Hz`), a manual reshape is needed:
+
 ```rust
 fn linear_3d(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
     let (batch, seq, features) = x.dims3()?;

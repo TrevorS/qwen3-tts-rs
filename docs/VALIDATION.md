@@ -38,6 +38,7 @@ Component-by-component validation of the Rust implementation against Python refe
 Generates semantic tokens (codebook 1) from text input.
 
 **Architecture:**
+
 - Text embedding: 151936 vocab → 2048 dim
 - Text projection: 2048 → 1024 (SwiGLU MLP)
 - 28 transformer layers:
@@ -54,6 +55,7 @@ Generates semantic tokens (codebook 1) from text input.
 Generates 15 acoustic tokens (codebooks 2-16) per semantic token.
 
 **Architecture:**
+
 - 5 transformer layers (same structure as talker)
 - 15 codec embeddings (2048 vocab → 1024 dim each)
 - 15 lm_heads (1024 → 2048 each)
@@ -63,6 +65,7 @@ Generates 15 acoustic tokens (codebooks 2-16) per semantic token.
 Converts 16-codebook tokens to 24kHz audio waveform.
 
 **Architecture:**
+
 - Split RVQ: 1 semantic + 15 acoustic quantizers
 - Codebook dim: 256, output proj to 512
 - Pre-conv: causal 1D conv (512 → 1024, kernel=3)
@@ -80,6 +83,7 @@ Converts 16-codebook tokens to 24kHz audio waveform.
 **Root cause:** Symmetric trimming (left + right) instead of right-only.
 
 **Fix:**
+
 ```rust
 // Correct: right-only trim for exact input * stride output
 let right_trim = kernel_size.saturating_sub(stride);
@@ -94,6 +98,7 @@ let right_trim = kernel_size - stride - pad;
 ### 2. QK Normalization
 
 Apply RMSNorm to Q and K after projection, before RoPE:
+
 ```rust
 let q = self.q_norm.forward(&q)?;
 let k = self.k_norm.forward(&k)?;
@@ -112,6 +117,7 @@ let rotated = Tensor::cat(&[
 ### 4. Head Dimension Override
 
 The model uses head_dim=128 explicitly, not hidden_size/num_heads=64:
+
 ```rust
 pub fn head_dim(&self) -> usize {
     self.head_dim_override.unwrap_or(self.hidden_size / self.num_attention_heads)
@@ -121,6 +127,7 @@ pub fn head_dim(&self) -> usize {
 ### 5. Linear for 3D Tensors
 
 Candle's matmul doesn't auto-broadcast 3D @ 2D:
+
 ```rust
 fn linear(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
     let (batch, seq, features) = x.dims3()?;
@@ -133,11 +140,13 @@ fn linear(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> 
 ## Running Validation
 
 1. Download test data:
+
 ```bash
 ./scripts/download_test_data.sh
 ```
 
 2. Export Python reference values:
+
 ```bash
 cd tools && uv sync
 uv run python export_reference_values.py
@@ -145,6 +154,7 @@ uv run python export_decoder_reference.py
 ```
 
 3. Run validation tests:
+
 ```bash
 cargo test --test reference_validation -- --nocapture
 ```
@@ -205,7 +215,7 @@ Inference tested with `--features flash-attn,cli` release build on CUDA:
 ### Dtype boundary fixes required for bf16
 
 1. **RoPE cos/sin**: Computed as F32 from position indices, must cast to input dtype (BF16) before multiply
-2. **Attention masks**: F32 masks must cast to `attn_weights.dtype()` in non-flash-attn path
-3. **Logit sampling**: BF16 logits must cast to F32 before `to_vec1::<f32>()` in penalty functions
-4. **Speaker embedding**: F32 speaker encoder output must cast to `compute_dtype` at the talker boundary
-5. **Empty tensors**: Hardcoded `DType::F32` in `get_projected_text_embeddings()` must match model dtype
+1. **Attention masks**: F32 masks must cast to `attn_weights.dtype()` in non-flash-attn path
+1. **Logit sampling**: BF16 logits must cast to F32 before `to_vec1::<f32>()` in penalty functions
+1. **Speaker embedding**: F32 speaker encoder output must cast to `compute_dtype` at the talker boundary
+1. **Empty tensors**: Hardcoded `DType::F32` in `get_projected_text_embeddings()` must match model dtype

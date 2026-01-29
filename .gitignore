@@ -14,9 +14,14 @@ tools/.venv/
 # Reference audio for voice cloning example (public domain, NASA)
 !/examples/data/apollo11_one_small_step.wav
 
+# README sample assets
+!/assets/audio/*.wav
+!/assets/images/*.png
+
 # Python cache
 __pycache__/
 *.pyc
 
 # UV lock file (large, can be regenerated)
 uv.lock
+/models/

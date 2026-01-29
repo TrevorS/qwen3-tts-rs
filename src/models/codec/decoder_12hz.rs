@@ -172,6 +172,14 @@ struct TransformerWeights {
     layers: Vec<TransformerLayerWeights>,
 }
 
+/// Fetch a weight tensor by key, returning a helpful error if missing.
+fn get_weight(weights: &HashMap<String, Tensor>, key: &str) -> Result<Tensor> {
+    weights
+        .get(key)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Missing weight: {}", key))
+}
+
 impl Decoder12Hz {
     /// Load decoder from safetensors weights
     pub fn from_weights(
@@ -180,14 +188,14 @@ impl Decoder12Hz {
     ) -> Result<Self> {
         // Load codebooks - normalize by cluster_usage as per official implementation
         // embedding = embedding_sum / cluster_usage
-        let first_embedding_sum = weights
-            .get("decoder.quantizer.rvq_first.vq.layers.0._codebook.embedding_sum")
-            .ok_or_else(|| anyhow::anyhow!("Missing first codebook embedding_sum"))?
-            .clone();
-        let first_cluster_usage = weights
-            .get("decoder.quantizer.rvq_first.vq.layers.0._codebook.cluster_usage")
-            .ok_or_else(|| anyhow::anyhow!("Missing first codebook cluster_usage"))?
-            .clone();
+        let first_embedding_sum = get_weight(
+            weights,
+            "decoder.quantizer.rvq_first.vq.layers.0._codebook.embedding_sum",
+        )?;
+        let first_cluster_usage = get_weight(
+            weights,
+            "decoder.quantizer.rvq_first.vq.layers.0._codebook.cluster_usage",
+        )?;
         // Normalize: embedding = embedding_sum / cluster_usage.clamp(min=epsilon).unsqueeze(-1)
         // Per official implementation, clamp cluster_usage to avoid divide-by-zero
         let epsilon = 1e-7f32;
@@ -197,196 +205,104 @@ impl Decoder12Hz {
 
         let mut rest_codebooks = Vec::with_capacity(15);
         for i in 0..15 {
-            let embedding_sum = weights
-                .get(&format!(
+            let embedding_sum = get_weight(
+                weights,
+                &format!(
                     "decoder.quantizer.rvq_rest.vq.layers.{}._codebook.embedding_sum",
                     i
-                ))
-                .ok_or_else(|| anyhow::anyhow!("Missing rest codebook {} embedding_sum", i))?
-                .clone();
-            let cluster_usage = weights
-                .get(&format!(
+                ),
+            )?;
+            let cluster_usage = get_weight(
+                weights,
+                &format!(
                     "decoder.quantizer.rvq_rest.vq.layers.{}._codebook.cluster_usage",
                     i
-                ))
-                .ok_or_else(|| anyhow::anyhow!("Missing rest codebook {} cluster_usage", i))?
-                .clone();
-            // Normalize: embedding = embedding_sum / cluster_usage.clamp(min=epsilon).unsqueeze(-1)
+                ),
+            )?;
             let cluster_usage_clamped = cluster_usage.clamp(epsilon, f32::MAX)?;
             let cb = embedding_sum.broadcast_div(&cluster_usage_clamped.unsqueeze(1)?)?;
             rest_codebooks.push(cb);
         }
 
         // Load output projections
-        let first_output_proj = weights
-            .get("decoder.quantizer.rvq_first.output_proj.weight")
-            .ok_or_else(|| anyhow::anyhow!("Missing first output proj"))?
-            .clone();
-        let rest_output_proj = weights
-            .get("decoder.quantizer.rvq_rest.output_proj.weight")
-            .ok_or_else(|| anyhow::anyhow!("Missing rest output proj"))?
-            .clone();
+        let first_output_proj =
+            get_weight(weights, "decoder.quantizer.rvq_first.output_proj.weight")?;
+        let rest_output_proj =
+            get_weight(weights, "decoder.quantizer.rvq_rest.output_proj.weight")?;
 
         // Load pre_conv
-        let pre_conv_weight = weights
-            .get("decoder.pre_conv.conv.weight")
-            .ok_or_else(|| anyhow::anyhow!("Missing pre_conv weight"))?
-            .clone();
-        let pre_conv_bias = weights
-            .get("decoder.pre_conv.conv.bias")
-            .ok_or_else(|| anyhow::anyhow!("Missing pre_conv bias"))?
-            .clone();
-        let pre_conv = CausalConv1d::from_weights(pre_conv_weight, Some(pre_conv_bias), 1)?;
+        let pre_conv = CausalConv1d::from_weights(
+            get_weight(weights, "decoder.pre_conv.conv.weight")?,
+            Some(get_weight(weights, "decoder.pre_conv.conv.bias")?),
+            1,
+        )?;
 
         // Load transformer projections
-        let input_proj_weight = weights
-            .get("decoder.pre_transformer.input_proj.weight")
-            .ok_or_else(|| anyhow::anyhow!("Missing input proj weight"))?
-            .clone();
-        let input_proj_bias = weights
-            .get("decoder.pre_transformer.input_proj.bias")
-            .ok_or_else(|| anyhow::anyhow!("Missing input proj bias"))?
-            .clone();
-        let output_proj_weight = weights
-            .get("decoder.pre_transformer.output_proj.weight")
-            .ok_or_else(|| anyhow::anyhow!("Missing output proj weight"))?
-            .clone();
-        let output_proj_bias = weights
-            .get("decoder.pre_transformer.output_proj.bias")
-            .ok_or_else(|| anyhow::anyhow!("Missing output proj bias"))?
-            .clone();
+        let input_proj_weight = get_weight(weights, "decoder.pre_transformer.input_proj.weight")?;
+        let input_proj_bias = get_weight(weights, "decoder.pre_transformer.input_proj.bias")?;
+        let output_proj_weight = get_weight(weights, "decoder.pre_transformer.output_proj.weight")?;
+        let output_proj_bias = get_weight(weights, "decoder.pre_transformer.output_proj.bias")?;
 
         // Load transformer layer weights
         let mut layers = Vec::with_capacity(config.num_layers);
         for i in 0..config.num_layers {
-            let prefix = format!("decoder.pre_transformer.layers.{}", i);
+            let p = format!("decoder.pre_transformer.layers.{}", i);
             let layer = TransformerLayerWeights {
-                input_ln_weight: weights
-                    .get(&format!("{}.input_layernorm.weight", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing layer {} input ln", i))?
-                    .clone(),
-                q_proj_weight: weights
-                    .get(&format!("{}.self_attn.q_proj.weight", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing layer {} q_proj", i))?
-                    .clone(),
-                k_proj_weight: weights
-                    .get(&format!("{}.self_attn.k_proj.weight", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing layer {} k_proj", i))?
-                    .clone(),
-                v_proj_weight: weights
-                    .get(&format!("{}.self_attn.v_proj.weight", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing layer {} v_proj", i))?
-                    .clone(),
-                o_proj_weight: weights
-                    .get(&format!("{}.self_attn.o_proj.weight", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing layer {} o_proj", i))?
-                    .clone(),
-                attn_layer_scale: weights
-                    .get(&format!("{}.self_attn_layer_scale.scale", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing layer {} attn scale", i))?
-                    .clone(),
-                post_ln_weight: weights
-                    .get(&format!("{}.post_attention_layernorm.weight", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing layer {} post ln", i))?
-                    .clone(),
-                gate_proj_weight: weights
-                    .get(&format!("{}.mlp.gate_proj.weight", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing layer {} gate proj", i))?
-                    .clone(),
-                up_proj_weight: weights
-                    .get(&format!("{}.mlp.up_proj.weight", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing layer {} up proj", i))?
-                    .clone(),
-                down_proj_weight: weights
-                    .get(&format!("{}.mlp.down_proj.weight", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing layer {} down proj", i))?
-                    .clone(),
-                mlp_layer_scale: weights
-                    .get(&format!("{}.mlp_layer_scale.scale", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing layer {} mlp scale", i))?
-                    .clone(),
+                input_ln_weight: get_weight(weights, &format!("{p}.input_layernorm.weight"))?,
+                q_proj_weight: get_weight(weights, &format!("{p}.self_attn.q_proj.weight"))?,
+                k_proj_weight: get_weight(weights, &format!("{p}.self_attn.k_proj.weight"))?,
+                v_proj_weight: get_weight(weights, &format!("{p}.self_attn.v_proj.weight"))?,
+                o_proj_weight: get_weight(weights, &format!("{p}.self_attn.o_proj.weight"))?,
+                attn_layer_scale: get_weight(weights, &format!("{p}.self_attn_layer_scale.scale"))?,
+                post_ln_weight: get_weight(
+                    weights,
+                    &format!("{p}.post_attention_layernorm.weight"),
+                )?,
+                gate_proj_weight: get_weight(weights, &format!("{p}.mlp.gate_proj.weight"))?,
+                up_proj_weight: get_weight(weights, &format!("{p}.mlp.up_proj.weight"))?,
+                down_proj_weight: get_weight(weights, &format!("{p}.mlp.down_proj.weight"))?,
+                mlp_layer_scale: get_weight(weights, &format!("{p}.mlp_layer_scale.scale"))?,
             };
             layers.push(layer);
         }
         let transformer_weights = TransformerWeights { layers };
 
         // Load final norm weight
-        let final_norm_weight = weights
-            .get("decoder.pre_transformer.norm.weight")
-            .ok_or_else(|| anyhow::anyhow!("Missing pre_transformer final norm weight"))?
-            .clone();
+        let final_norm_weight = get_weight(weights, "decoder.pre_transformer.norm.weight")?;
 
         // Load upsample stages
         let mut upsample_stages = Vec::with_capacity(config.upsampling_ratios.len());
         for (i, &ratio) in config.upsampling_ratios.iter().enumerate() {
-            let prefix = format!("decoder.upsample.{}", i);
+            let p = format!("decoder.upsample.{}", i);
             let stage = UpsampleStage::from_weights(
-                weights
-                    .get(&format!("{}.0.conv.weight", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing upsample {} conv weight", i))?
-                    .clone(),
-                weights
-                    .get(&format!("{}.0.conv.bias", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing upsample {} conv bias", i))?
-                    .clone(),
-                weights
-                    .get(&format!("{}.1.dwconv.conv.weight", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing upsample {} dwconv weight", i))?
-                    .clone(),
-                weights
-                    .get(&format!("{}.1.dwconv.conv.bias", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing upsample {} dwconv bias", i))?
-                    .clone(),
-                weights
-                    .get(&format!("{}.1.norm.weight", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing upsample {} norm weight", i))?
-                    .clone(),
-                weights
-                    .get(&format!("{}.1.norm.bias", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing upsample {} norm bias", i))?
-                    .clone(),
-                weights
-                    .get(&format!("{}.1.pwconv1.weight", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing upsample {} pwconv1 weight", i))?
-                    .clone(),
-                weights
-                    .get(&format!("{}.1.pwconv1.bias", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing upsample {} pwconv1 bias", i))?
-                    .clone(),
-                weights
-                    .get(&format!("{}.1.pwconv2.weight", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing upsample {} pwconv2 weight", i))?
-                    .clone(),
-                weights
-                    .get(&format!("{}.1.pwconv2.bias", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing upsample {} pwconv2 bias", i))?
-                    .clone(),
-                weights
-                    .get(&format!("{}.1.gamma", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing upsample {} gamma", i))?
-                    .clone(),
+                get_weight(weights, &format!("{p}.0.conv.weight"))?,
+                get_weight(weights, &format!("{p}.0.conv.bias"))?,
+                get_weight(weights, &format!("{p}.1.dwconv.conv.weight"))?,
+                get_weight(weights, &format!("{p}.1.dwconv.conv.bias"))?,
+                get_weight(weights, &format!("{p}.1.norm.weight"))?,
+                get_weight(weights, &format!("{p}.1.norm.bias"))?,
+                get_weight(weights, &format!("{p}.1.pwconv1.weight"))?,
+                get_weight(weights, &format!("{p}.1.pwconv1.bias"))?,
+                get_weight(weights, &format!("{p}.1.pwconv2.weight"))?,
+                get_weight(weights, &format!("{p}.1.pwconv2.bias"))?,
+                get_weight(weights, &format!("{p}.1.gamma"))?,
                 ratio,
             )?;
             upsample_stages.push(stage);
         }
 
         // Load decoder.0 (initial conv)
-        let decoder_init_weight = weights
-            .get("decoder.decoder.0.conv.weight")
-            .ok_or_else(|| anyhow::anyhow!("Missing decoder.0 weight"))?
-            .clone();
-        let decoder_init_bias = weights
-            .get("decoder.decoder.0.conv.bias")
-            .ok_or_else(|| anyhow::anyhow!("Missing decoder.0 bias"))?
-            .clone();
-        let decoder_init_conv =
-            CausalConv1d::from_weights(decoder_init_weight, Some(decoder_init_bias), 1)?;
+        let decoder_init_conv = CausalConv1d::from_weights(
+            get_weight(weights, "decoder.decoder.0.conv.weight")?,
+            Some(get_weight(weights, "decoder.decoder.0.conv.bias")?),
+            1,
+        )?;
 
         // Load decoder blocks (1-4)
         let mut decoder_blocks = Vec::with_capacity(config.upsample_rates.len());
         for (i, &rate) in config.upsample_rates.iter().enumerate() {
             let block_idx = i + 1;
-            let prefix = format!("decoder.decoder.{}.block", block_idx);
+            let bp = format!("decoder.decoder.{}.block", block_idx);
 
             // Helper to load residual unit weights
             #[allow(clippy::type_complexity)]
@@ -400,39 +316,16 @@ impl Decoder12Hz {
                 Tensor,
                 Tensor,
             )> {
+                let u = format!("{bp}.{unit_idx}");
                 Ok((
-                    weights
-                        .get(&format!("{}.{}.act1.alpha", prefix, unit_idx))
-                        .ok_or_else(|| anyhow::anyhow!("Missing"))?
-                        .clone(),
-                    weights
-                        .get(&format!("{}.{}.act1.beta", prefix, unit_idx))
-                        .ok_or_else(|| anyhow::anyhow!("Missing"))?
-                        .clone(),
-                    weights
-                        .get(&format!("{}.{}.conv1.conv.weight", prefix, unit_idx))
-                        .ok_or_else(|| anyhow::anyhow!("Missing"))?
-                        .clone(),
-                    weights
-                        .get(&format!("{}.{}.conv1.conv.bias", prefix, unit_idx))
-                        .ok_or_else(|| anyhow::anyhow!("Missing"))?
-                        .clone(),
-                    weights
-                        .get(&format!("{}.{}.act2.alpha", prefix, unit_idx))
-                        .ok_or_else(|| anyhow::anyhow!("Missing"))?
-                        .clone(),
-                    weights
-                        .get(&format!("{}.{}.act2.beta", prefix, unit_idx))
-                        .ok_or_else(|| anyhow::anyhow!("Missing"))?
-                        .clone(),
-                    weights
-                        .get(&format!("{}.{}.conv2.conv.weight", prefix, unit_idx))
-                        .ok_or_else(|| anyhow::anyhow!("Missing"))?
-                        .clone(),
-                    weights
-                        .get(&format!("{}.{}.conv2.conv.bias", prefix, unit_idx))
-                        .ok_or_else(|| anyhow::anyhow!("Missing"))?
-                        .clone(),
+                    get_weight(weights, &format!("{u}.act1.alpha"))?,
+                    get_weight(weights, &format!("{u}.act1.beta"))?,
+                    get_weight(weights, &format!("{u}.conv1.conv.weight"))?,
+                    get_weight(weights, &format!("{u}.conv1.conv.bias"))?,
+                    get_weight(weights, &format!("{u}.act2.alpha"))?,
+                    get_weight(weights, &format!("{u}.act2.beta"))?,
+                    get_weight(weights, &format!("{u}.conv2.conv.weight"))?,
+                    get_weight(weights, &format!("{u}.conv2.conv.bias"))?,
                 ))
             };
 
@@ -441,22 +334,10 @@ impl Decoder12Hz {
             let (r3_a1a, r3_a1b, r3_c1w, r3_c1b, r3_a2a, r3_a2b, r3_c2w, r3_c2b) = load_res(4)?;
 
             let block = DecoderBlock::from_weights(
-                weights
-                    .get(&format!("{}.0.alpha", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing"))?
-                    .clone(),
-                weights
-                    .get(&format!("{}.0.beta", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing"))?
-                    .clone(),
-                weights
-                    .get(&format!("{}.1.conv.weight", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing"))?
-                    .clone(),
-                weights
-                    .get(&format!("{}.1.conv.bias", prefix))
-                    .ok_or_else(|| anyhow::anyhow!("Missing"))?
-                    .clone(),
+                get_weight(weights, &format!("{bp}.0.alpha"))?,
+                get_weight(weights, &format!("{bp}.0.beta"))?,
+                get_weight(weights, &format!("{bp}.1.conv.weight"))?,
+                get_weight(weights, &format!("{bp}.1.conv.bias"))?,
                 r1_a1a,
                 r1_a1b,
                 r1_c1w,
@@ -488,26 +369,16 @@ impl Decoder12Hz {
 
         // Load final SnakeBeta (decoder.5)
         let final_snake = SnakeBeta::from_weights(
-            weights
-                .get("decoder.decoder.5.alpha")
-                .ok_or_else(|| anyhow::anyhow!("Missing decoder.5 alpha"))?
-                .clone(),
-            weights
-                .get("decoder.decoder.5.beta")
-                .ok_or_else(|| anyhow::anyhow!("Missing decoder.5 beta"))?
-                .clone(),
+            get_weight(weights, "decoder.decoder.5.alpha")?,
+            get_weight(weights, "decoder.decoder.5.beta")?,
         )?;
 
         // Load final conv (decoder.6)
-        let final_conv_weight = weights
-            .get("decoder.decoder.6.conv.weight")
-            .ok_or_else(|| anyhow::anyhow!("Missing decoder.6 weight"))?
-            .clone();
-        let final_conv_bias = weights
-            .get("decoder.decoder.6.conv.bias")
-            .ok_or_else(|| anyhow::anyhow!("Missing decoder.6 bias"))?
-            .clone();
-        let final_conv = CausalConv1d::from_weights(final_conv_weight, Some(final_conv_bias), 1)?;
+        let final_conv = CausalConv1d::from_weights(
+            get_weight(weights, "decoder.decoder.6.conv.weight")?,
+            Some(get_weight(weights, "decoder.decoder.6.conv.bias")?),
+            1,
+        )?;
 
         Ok(Self {
             config,

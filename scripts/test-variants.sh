@@ -20,6 +20,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 BIN="$REPO_ROOT/target/release/generate_audio"
 MODELS_DIR="$REPO_ROOT/test_data/models"
+TOKENIZER_DIR="$REPO_ROOT/test_data/tokenizer"
 REF_AUDIO="$REPO_ROOT/examples/data/apollo11_one_small_step.wav"
 REF_TEXT="That's one small step for man, one giant leap for mankind."
 TEXT="Hello world, this is a test."
@@ -195,6 +196,7 @@ add_test() {
     local label="$1"; shift
     TEST_LABELS+=("$label")
     # Store args as a declare-p'd array for safe retrieval
+    # shellcheck disable=SC2034
     local -a args=("$@")
     eval "TEST_${test_count}_ARGS=(\"\${args[@]}\")"
     test_count=$((test_count + 1))
@@ -204,26 +206,30 @@ for name in "${MODEL_NAMES[@]}"; do
     model_dir="${MODEL_PATHS[$name]}"
     model_type="${MODEL_TYPES[$name]}"
 
+    # Resolve tokenizer: prefer model dir, fall back to shared tokenizer dir
+    tokenizer_args=()
+    if [[ -f "$model_dir/tokenizer.json" ]]; then
+        tokenizer_args=(--tokenizer-dir "$model_dir")
+    elif [[ -f "$TOKENIZER_DIR/tokenizer.json" ]]; then
+        tokenizer_args=(--tokenizer-dir "$TOKENIZER_DIR")
+    fi
+
     if [[ "$model_type" == "base" ]]; then
         # Base models: x_vector_only and ICL
         if [[ -f "$REF_AUDIO" ]]; then
             add_test "${name}-xvector" \
-                --model-dir "$model_dir" --ref-audio "$REF_AUDIO" --x-vector-only
+                --model-dir "$model_dir" "${tokenizer_args[@]}" --ref-audio "$REF_AUDIO" --x-vector-only
             add_test "${name}-icl" \
-                --model-dir "$model_dir" --ref-audio "$REF_AUDIO" --ref-text "$REF_TEXT"
+                --model-dir "$model_dir" "${tokenizer_args[@]}" --ref-audio "$REF_AUDIO" --ref-text "$REF_TEXT"
         else
             echo "WARN: Skipping base model $name (no reference audio: $REF_AUDIO)"
         fi
     elif [[ "$model_type" == "voicedesign" ]]; then
         # VoiceDesign models: text-described voice via --instruct
         add_test "${name}-instruct" \
-            --model-dir "$model_dir" --instruct "$INSTRUCT"
+            --model-dir "$model_dir" "${tokenizer_args[@]}" --instruct "$INSTRUCT"
     else
         # CustomVoice: preset speakers
-        tokenizer_args=()
-        if [[ -f "$model_dir/tokenizer.json" ]]; then
-            tokenizer_args=(--tokenizer-dir "$model_dir")
-        fi
         add_test "${name}-ryan" \
             --model-dir "$model_dir" "${tokenizer_args[@]}" --speaker ryan
         add_test "${name}-serena" \
@@ -255,6 +261,7 @@ for device in "${DEVICES[@]}"; do
         for i in "${!TEST_LABELS[@]}"; do
             base_label="${TEST_LABELS[$i]}"
             # Retrieve the args array for this test
+            # shellcheck disable=SC2154
             eval "test_args=(\"\${TEST_${i}_ARGS[@]}\")"
             run_num=$((run_num + 1))
 
@@ -270,6 +277,7 @@ for device in "${DEVICES[@]}"; do
 
             # Run and capture time
             start_time=$(date +%s%N)
+            # shellcheck disable=SC2154
             if "$BIN" --device "$device" "${test_args[@]}" \
                 --text "$TEXT" --duration "$DURATION" --seed "$seed" \
                 --output "$outfile" >/dev/null 2>&1; then

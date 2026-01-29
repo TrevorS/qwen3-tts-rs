@@ -195,7 +195,7 @@ mod model_tests {
 mod generation_tests {
     use super::*;
     use qwen3_tts::generation::{
-        apply_repetition_penalty, greedy_sample, sample, GenerationConfig,
+        apply_repetition_penalty, greedy_sample, sample, GenerationConfig, SamplingContext,
     };
 
     #[test]
@@ -215,7 +215,8 @@ mod generation_tests {
             temperature: 0.001,
             ..Default::default()
         };
-        let result = sample(&logits, &config).unwrap();
+        let mut ctx = SamplingContext::new(Some(42));
+        let result = sample(&logits, &config, &mut ctx).unwrap();
         let idx: Vec<u32> = result.to_vec1().unwrap();
         assert_eq!(idx[0], 1);
     }
@@ -251,6 +252,7 @@ mod end_to_end_mock {
             eos_token_id: Some(qwen3_tts::CODEC_EOS_TOKEN_ID),
             chunk_frames: 10,
             min_new_tokens: 2,
+            seed: Some(42),
         };
 
         assert_eq!(options.max_length, 512);
@@ -524,7 +526,7 @@ mod speech_tokenizer_tests {
         let tensors = SafeTensors::deserialize(&model_bytes).unwrap();
 
         // Find encoder embedding weights
-        let encoder_tensors: Vec<&String> = tensors
+        let encoder_tensors: Vec<&str> = tensors
             .names()
             .iter()
             .filter(|n| n.starts_with("encoder."))
@@ -555,7 +557,7 @@ mod speech_tokenizer_tests {
         let tensors = SafeTensors::deserialize(&model_bytes).unwrap();
 
         // Find decoder weights
-        let decoder_tensors: Vec<&String> = tensors
+        let decoder_tensors: Vec<&str> = tensors
             .names()
             .iter()
             .filter(|n| n.starts_with("decoder."))
@@ -587,7 +589,7 @@ mod speech_tokenizer_tests {
 
         // Find quantizer/codebook weights
         let all_names = tensors.names();
-        let codebook_tensors: Vec<&String> = all_names
+        let codebook_tensors: Vec<&str> = all_names
             .iter()
             .filter(|n| n.contains("quantiz") || n.contains("codebook") || n.contains("embed"))
             .cloned()
@@ -891,7 +893,7 @@ mod model_weights_tests {
         let mut groups: HashMap<String, Vec<String>> = HashMap::new();
         for name in tensors.names() {
             let prefix = name.split('.').next().unwrap_or(name).to_string();
-            groups.entry(prefix).or_default().push(name.clone());
+            groups.entry(prefix).or_default().push(name.to_string());
         }
 
         println!("Model tensor groups:");
@@ -931,7 +933,7 @@ mod model_weights_tests {
         println!("Talker sub-components: {:?}", sub_components);
 
         // Find layer tensors - the model uses "talker.model.layers." structure
-        let layer_tensors: Vec<&String> = tensors
+        let layer_tensors: Vec<&str> = tensors
             .names()
             .iter()
             .filter(|n| n.contains(".layers."))
@@ -979,7 +981,7 @@ mod model_weights_tests {
         let tensors = SafeTensors::deserialize(&model_bytes).unwrap();
 
         // Find embedding tensor
-        let embed_names: Vec<&String> = tensors
+        let embed_names: Vec<&str> = tensors
             .names()
             .iter()
             .filter(|n| n.contains("embed") && n.contains("token"))
@@ -1057,7 +1059,7 @@ mod model_weights_tests {
         let tensors = SafeTensors::deserialize(&model_bytes).unwrap();
 
         // Find speaker encoder tensors
-        let speaker_tensors: Vec<&String> = tensors
+        let speaker_tensors: Vec<&str> = tensors
             .names()
             .iter()
             .filter(|n| n.contains("speaker"))
@@ -1090,7 +1092,7 @@ mod model_weights_tests {
         let tensors = SafeTensors::deserialize(&model_bytes).unwrap();
 
         // Find code embedding tensors (for audio tokens)
-        let code_embed_names: Vec<&String> = tensors
+        let code_embed_names: Vec<&str> = tensors
             .names()
             .iter()
             .filter(|n| n.contains("code") && n.contains("embed"))
@@ -1121,7 +1123,7 @@ mod model_weights_tests {
         let tensors = SafeTensors::deserialize(&model_bytes).unwrap();
 
         // Find LM head / output projection
-        let lm_head_names: Vec<&String> = tensors
+        let lm_head_names: Vec<&str> = tensors
             .names()
             .iter()
             .filter(|n| n.contains("lm_head") || n.contains("output"))
@@ -1198,7 +1200,7 @@ mod voice_clone_tests {
 
         let model = Qwen3TTS::from_pretrained(MODEL_DIR, Device::Cpu).unwrap();
         assert!(
-            model.has_speaker_encoder(),
+            model.supports_voice_cloning(),
             "Base model should have speaker encoder"
         );
     }

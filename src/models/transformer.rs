@@ -12,11 +12,64 @@ use candle_flash_attn::flash_attn;
 
 use super::config::Qwen3TTSConfig;
 
+/// Create a causal attention mask.
+///
+/// Returns a `[1, 1, seq_len, offset + seq_len]` tensor where position `(i, j)`
+/// is `0.0` if `j <= offset + i` (allowed) and `NEG_INFINITY` (masked).
+pub fn create_causal_mask(seq_len: usize, offset: usize, device: &Device) -> Result<Tensor> {
+    let total_len = offset + seq_len;
+    let mask: Vec<f32> = (0..seq_len)
+        .flat_map(|i| {
+            (0..total_len).map(move |j| {
+                if j <= offset + i {
+                    0.0
+                } else {
+                    f32::NEG_INFINITY
+                }
+            })
+        })
+        .collect();
+
+    Ok(Tensor::new(mask.as_slice(), device)?.reshape((1, 1, seq_len, total_len))?)
+}
+
+/// Apply RoPE rotation to a tensor.
+///
+/// `x` has shape `[batch, heads, seq_len, head_dim]`.
+/// `cos` and `sin` have shape `[seq_len, head_dim/2]`.
+fn apply_rope_rotation(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    let (_b, _h, _seq, d) = x.dims4()?;
+    let x1 = x.narrow(D::Minus1, 0, d / 2)?;
+    let x2 = x.narrow(D::Minus1, d / 2, d / 2)?;
+
+    // Broadcast cos/sin from [seq_len, half_dim] to [1, 1, seq_len, half_dim]
+    let cos = cos
+        .unsqueeze(0)?
+        .unsqueeze(0)?
+        .to_dtype(x.dtype())?
+        .broadcast_as(x1.shape())?;
+    let sin = sin
+        .unsqueeze(0)?
+        .unsqueeze(0)?
+        .to_dtype(x.dtype())?
+        .broadcast_as(x1.shape())?;
+
+    // Standard RoPE: [x1*cos - x2*sin, x2*cos + x1*sin]
+    let rotated = Tensor::cat(
+        &[
+            &(x1.mul(&cos)? - x2.mul(&sin)?)?,
+            &(x2.mul(&cos)? + x1.mul(&sin)?)?,
+        ],
+        D::Minus1,
+    )?;
+
+    Ok(rotated)
+}
+
 /// Rotary position embedding (standard RoPE)
 pub struct RotaryEmbedding {
     cos: Tensor,
     sin: Tensor,
-    _dim: usize,
 }
 
 impl RotaryEmbedding {
@@ -34,11 +87,7 @@ impl RotaryEmbedding {
         let cos = freqs.cos()?;
         let sin = freqs.sin()?;
 
-        Ok(Self {
-            cos,
-            sin,
-            _dim: dim,
-        })
+        Ok(Self { cos, sin })
     }
 
     pub fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
@@ -46,37 +95,10 @@ impl RotaryEmbedding {
         let cos = self.cos.i(offset..offset + seq_len)?;
         let sin = self.sin.i(offset..offset + seq_len)?;
 
-        let q_rot = self.rotate(q, &cos, &sin)?;
-        let k_rot = self.rotate(k, &cos, &sin)?;
+        let q_rot = apply_rope_rotation(q, &cos, &sin)?;
+        let k_rot = apply_rope_rotation(k, &cos, &sin)?;
 
         Ok((q_rot, k_rot))
-    }
-
-    fn rotate(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-        let (_b, _h, _seq, d) = x.dims4()?;
-        let x1 = x.narrow(D::Minus1, 0, d / 2)?;
-        let x2 = x.narrow(D::Minus1, d / 2, d / 2)?;
-
-        // Broadcast cos/sin to match x dimensions
-        // cos/sin are [seq_len, head_dim/2], need [1, 1, seq_len, head_dim/2]
-        // Cast to x's dtype (cos/sin are computed in f32, x may be bf16)
-        let cos = cos.unsqueeze(0)?.unsqueeze(0)?;
-        let sin = sin.unsqueeze(0)?.unsqueeze(0)?;
-        let cos = cos.to_dtype(x.dtype())?.broadcast_as(x1.shape())?;
-        let sin = sin.to_dtype(x.dtype())?.broadcast_as(x1.shape())?;
-
-        // Standard RoPE: x * cos + rotate_half(x) * sin
-        // where rotate_half([x1, x2]) = [-x2, x1]
-        // Result: [x1*cos - x2*sin, x2*cos + x1*sin]
-        let rotated = Tensor::cat(
-            &[
-                &(x1.mul(&cos)? - x2.mul(&sin)?)?,
-                &(x2.mul(&cos)? + x1.mul(&sin)?)?,
-            ],
-            D::Minus1,
-        )?;
-
-        Ok(rotated)
     }
 }
 
@@ -87,12 +109,6 @@ impl RotaryEmbedding {
 /// still affects how frequencies are distributed across the head dimension.
 pub struct MRoPE {
     inv_freq: Tensor,
-    /// MRoPE section sizes [T, H, W] - stored for potential future use
-    _mrope_section: [usize; 3],
-    /// Precomputed interleaving masks - stored for potential future use
-    _h_mask: Vec<bool>,
-    _w_mask: Vec<bool>,
-    _dim: usize,
     device: Device,
 }
 
@@ -105,9 +121,12 @@ impl MRoPE {
     /// - 20 frequency pairs for width (W)
     ///
     /// Total = 64 = head_dim / 2
-    pub fn new(dim: usize, theta: f64, mrope_section: [usize; 3], device: &Device) -> Result<Self> {
-        let half_dim = dim / 2;
-
+    pub fn new(
+        dim: usize,
+        theta: f64,
+        _mrope_section: [usize; 3],
+        device: &Device,
+    ) -> Result<Self> {
         // Compute inverse frequencies
         let inv_freq: Vec<f32> = (0..dim)
             .step_by(2)
@@ -115,25 +134,8 @@ impl MRoPE {
             .collect();
         let inv_freq = Tensor::new(inv_freq.as_slice(), device)?;
 
-        // Precompute interleaving masks
-        // H mask: positions where index % 3 == 1, up to length mrope_section[1] * 3
-        // W mask: positions where index % 3 == 2, up to length mrope_section[2] * 3
-        let h_length = mrope_section[1] * 3; // 60
-        let w_length = mrope_section[2] * 3; // 60
-
-        let h_mask: Vec<bool> = (0..half_dim)
-            .map(|i| (i % 3 == 1) && (i < h_length))
-            .collect();
-        let w_mask: Vec<bool> = (0..half_dim)
-            .map(|i| (i % 3 == 2) && (i < w_length))
-            .collect();
-
         Ok(Self {
             inv_freq,
-            _mrope_section: mrope_section,
-            _h_mask: h_mask,
-            _w_mask: w_mask,
-            _dim: dim,
             device: device.clone(),
         })
     }
@@ -164,74 +166,16 @@ impl MRoPE {
         let inv_freq_row = self.inv_freq.unsqueeze(0)?; // [1, head_dim/2]
         let freqs = pos_col.matmul(&inv_freq_row)?; // [seq_len, head_dim/2]
 
-        // For TTS, all 3 dimensions have the same position, so freqs_t = freqs_h = freqs_w
-        // But we still need to apply the interleaved layout
+        // For TTS, all 3 dimensions have the same position, so freqs_t = freqs_h = freqs_w.
+        // The interleaving is a no-op when all positions are identical.
+        // freqs is already [seq_len, head_dim/2] — compute cos/sin directly.
+        let cos = freqs.cos()?;
+        let sin = freqs.sin()?;
 
-        // Apply interleaved MRoPE combination
-        // The Python code does:
-        // freqs_combined = where(h_mask, freqs_h, freqs_t)
-        // freqs_combined = where(w_mask, freqs_w, freqs_combined)
-        //
-        // Since freqs_t = freqs_h = freqs_w for TTS, the result is just freqs!
-        // But we need to match the exact computation for numerical equivalence.
-        let freqs_combined = self.apply_interleaved(&freqs)?;
-
-        // Concatenate for full head_dim: [seq_len, head_dim]
-        let emb = Tensor::cat(&[&freqs_combined, &freqs_combined], 1)?;
-
-        let cos = emb.cos()?;
-        let sin = emb.sin()?;
-
-        // Apply rotation
-        let q_rot = self.rotate(q, &cos, &sin)?;
-        let k_rot = self.rotate(k, &cos, &sin)?;
+        let q_rot = apply_rope_rotation(q, &cos, &sin)?;
+        let k_rot = apply_rope_rotation(k, &cos, &sin)?;
 
         Ok((q_rot, k_rot))
-    }
-
-    /// Apply interleaved MRoPE layout
-    ///
-    /// Even though all 3 modalities have the same positions for TTS,
-    /// we still need to match the exact computation for numerical equivalence.
-    fn apply_interleaved(&self, freqs: &Tensor) -> Result<Tensor> {
-        // For TTS where all positions are the same, freqs_t = freqs_h = freqs_w
-        // The interleaving is a no-op in terms of values, but we compute it
-        // the same way as Python for exact numerical match.
-        //
-        // In Python: freqs_combined = where(h_mask, freqs_h, freqs_t)
-        //            freqs_combined = where(w_mask, freqs_w, freqs_combined)
-        // Since freqs_t == freqs_h == freqs_w, result == freqs
-        Ok(freqs.clone())
-    }
-
-    fn rotate(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-        let (_b, _h, _seq, d) = x.dims4()?;
-        let x1 = x.narrow(D::Minus1, 0, d / 2)?;
-        let x2 = x.narrow(D::Minus1, d / 2, d / 2)?;
-
-        // cos/sin are [seq_len, head_dim], need [1, 1, seq_len, head_dim]
-        // Cast to x's dtype (cos/sin are computed in f32, x may be bf16)
-        let cos = cos.unsqueeze(0)?.unsqueeze(0)?.to_dtype(x.dtype())?;
-        let sin = sin.unsqueeze(0)?.unsqueeze(0)?.to_dtype(x.dtype())?;
-
-        // For rotation, we need half of cos/sin
-        let cos_half = cos.narrow(D::Minus1, 0, d / 2)?;
-        let sin_half = sin.narrow(D::Minus1, 0, d / 2)?;
-
-        let cos_half = cos_half.broadcast_as(x1.shape())?;
-        let sin_half = sin_half.broadcast_as(x1.shape())?;
-
-        // RoPE rotation: rotate_half([x1, x2]) = [-x2, x1]
-        // Result: [x1*cos - x2*sin, x2*cos + x1*sin]
-        let rotated = Tensor::cat(
-            &[
-                &(x1.mul(&cos_half)? - x2.mul(&sin_half)?)?,
-                &(x2.mul(&cos_half)? + x1.mul(&sin_half)?)?,
-            ],
-            D::Minus1,
-        )?;
-
-        Ok(rotated)
     }
 }
 
@@ -540,41 +484,35 @@ impl KVCache {
         Ok(v)
     }
 
-    /// Get K cache sum for debugging
-    pub fn k_sum(&self) -> f32 {
-        self.k
-            .as_ref()
-            .map(|k| {
-                k.to_dtype(candle_core::DType::F32)
-                    .unwrap()
-                    .flatten_all()
-                    .unwrap()
-                    .to_vec1::<f32>()
-                    .unwrap()
-                    .iter()
-                    .sum()
-            })
-            .unwrap_or(0.0)
+    /// Get K cache sum for debugging. Returns 0.0 if cache is empty.
+    pub fn k_sum(&self) -> Result<f32> {
+        match &self.k {
+            Some(k) => {
+                let vals: Vec<f32> = k
+                    .to_dtype(candle_core::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1()?;
+                Ok(vals.iter().sum())
+            }
+            None => Ok(0.0),
+        }
     }
 
-    /// Get V cache sum for debugging
-    pub fn v_sum(&self) -> f32 {
-        self.v
-            .as_ref()
-            .map(|v| {
-                v.to_dtype(candle_core::DType::F32)
-                    .unwrap()
-                    .flatten_all()
-                    .unwrap()
-                    .to_vec1::<f32>()
-                    .unwrap()
-                    .iter()
-                    .sum()
-            })
-            .unwrap_or(0.0)
+    /// Get V cache sum for debugging. Returns 0.0 if cache is empty.
+    pub fn v_sum(&self) -> Result<f32> {
+        match &self.v {
+            Some(v) => {
+                let vals: Vec<f32> = v
+                    .to_dtype(candle_core::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1()?;
+                Ok(vals.iter().sum())
+            }
+            None => Ok(0.0),
+        }
     }
 
-    /// Get K cache shape for debugging
+    /// Get K cache shape for debugging.
     pub fn k_shape(&self) -> Option<Vec<usize>> {
         self.k.as_ref().map(|k| k.dims().to_vec())
     }

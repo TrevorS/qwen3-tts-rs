@@ -7,6 +7,19 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 
+fn st_dtype_to_candle(dt: safetensors::Dtype) -> Result<DType> {
+    match dt {
+        safetensors::Dtype::F32 => Ok(DType::F32),
+        safetensors::Dtype::F64 => Ok(DType::F64),
+        safetensors::Dtype::F16 => Ok(DType::F16),
+        safetensors::Dtype::BF16 => Ok(DType::BF16),
+        safetensors::Dtype::U8 => Ok(DType::U8),
+        safetensors::Dtype::U32 => Ok(DType::U32),
+        safetensors::Dtype::I64 => Ok(DType::I64),
+        other => anyhow::bail!("Unsupported safetensors dtype: {:?}", other),
+    }
+}
+
 fn load_weights(path: &str) -> Result<HashMap<String, Tensor>> {
     let data = fs::read(path)?;
     let safetensors = SafeTensors::deserialize(&data)?;
@@ -15,9 +28,13 @@ fn load_weights(path: &str) -> Result<HashMap<String, Tensor>> {
     let mut weights = HashMap::new();
     for name in safetensors.names() {
         let view = safetensors.tensor(name)?;
-        let tensor =
-            Tensor::from_raw_buffer(view.data(), view.dtype().try_into()?, view.shape(), &device)?
-                .to_dtype(DType::F32)?;
+        let tensor = Tensor::from_raw_buffer(
+            view.data(),
+            st_dtype_to_candle(view.dtype())?,
+            view.shape(),
+            &device,
+        )?
+        .to_dtype(DType::F32)?;
         weights.insert(name.to_string(), tensor);
     }
     Ok(weights)
@@ -124,6 +141,7 @@ fn gelu(x: &Tensor) -> Result<Tensor> {
 }
 
 #[test]
+#[ignore = "requires test_data model files not included in repo"]
 fn test_decoder_stages_compare() -> Result<()> {
     let weights = load_weights("test_data/speech_tokenizer/model.safetensors")?;
     let codes_flat = load_codes("test_data/rust_audio_final/codes_seed42_frames75.bin")?;
@@ -745,6 +763,7 @@ fn test_decoder_stages_compare() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires test_data model files not included in repo"]
 fn test_decode_75_frames() -> Result<()> {
     use qwen3_tts::models::codec::{Decoder12Hz, Decoder12HzConfig};
 

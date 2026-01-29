@@ -19,8 +19,6 @@ use candle_nn::{conv_transpose1d, ConvTranspose1d, ConvTranspose1dConfig, VarBui
 /// This matches the official Qwen3-TTS tokenizer behavior.
 pub struct CausalTransConv1d {
     conv: ConvTranspose1d,
-    /// Number of samples to trim from the left of output
-    left_trim: usize,
     /// Number of samples to trim from the right of output
     right_trim: usize,
 }
@@ -55,13 +53,8 @@ impl CausalTransConv1d {
         // Only trim from the right side for exact input * stride output
         // This maintains causality while preserving length
         let right_trim = kernel_size.saturating_sub(stride);
-        let left_trim = 0;
 
-        Ok(Self {
-            conv,
-            left_trim,
-            right_trim,
-        })
+        Ok(Self { conv, right_trim })
     }
 
     /// Create from raw weight and bias tensors.
@@ -84,13 +77,8 @@ impl CausalTransConv1d {
         // Only trim from the right side for exact input * stride output
         // This maintains causality while preserving length
         let right_trim = kernel_size.saturating_sub(stride);
-        let left_trim = 0;
 
-        Ok(Self {
-            conv,
-            left_trim,
-            right_trim,
-        })
+        Ok(Self { conv, right_trim })
     }
 
     /// Forward pass with causal output trimming.
@@ -103,9 +91,9 @@ impl CausalTransConv1d {
 
         // Trim output for causality
         let out_len = out.dim(2)?;
-        if self.left_trim > 0 || self.right_trim > 0 {
+        if self.right_trim > 0 {
             let end = out_len.saturating_sub(self.right_trim);
-            Ok(out.narrow(2, self.left_trim, end - self.left_trim)?)
+            Ok(out.narrow(2, 0, end)?)
         } else {
             Ok(out)
         }
@@ -141,7 +129,6 @@ mod tests {
         let conv = CausalTransConv1d::from_weights(weight, Some(bias), 2).unwrap();
 
         // Official behavior: trim only from right side
-        assert_eq!(conv.left_trim, 0);
         assert_eq!(conv.right_trim, 2);
 
         // Input: [batch=1, channels=64, seq=10]
@@ -163,7 +150,6 @@ mod tests {
 
         let conv = CausalTransConv1d::from_weights(weight, Some(bias), 2).unwrap();
         // No trimming needed when kernel == stride
-        assert_eq!(conv.left_trim, 0);
         assert_eq!(conv.right_trim, 0);
 
         let input = Tensor::randn(0.0f32, 1.0, (1, 32, 5), &device).unwrap();
@@ -195,7 +181,6 @@ mod tests {
 
             // Verify trimming: only trim from right side
             let expected_right_trim = kernel_size - stride;
-            assert_eq!(conv.left_trim, 0);
             assert_eq!(conv.right_trim, expected_right_trim);
 
             let input = Tensor::randn(0.0f32, 1.0, (1, 16, 4), &device).unwrap();

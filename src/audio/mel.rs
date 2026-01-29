@@ -215,7 +215,6 @@ impl MelSpectrogram {
 
         for i in 0..n_frames {
             let start = i * hop_length;
-            let _end = start + n_fft;
 
             // Apply window and prepare FFT input
             let mut buffer: Vec<FftComplex<f32>> = (0..n_fft)

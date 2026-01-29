@@ -117,37 +117,6 @@ struct Args {
     device: String,
 }
 
-fn parse_speaker(name: &str) -> Result<Speaker> {
-    match name.to_lowercase().as_str() {
-        "ryan" => Ok(Speaker::Ryan),
-        "serena" => Ok(Speaker::Serena),
-        "vivian" => Ok(Speaker::Vivian),
-        "aiden" => Ok(Speaker::Aiden),
-        "uncle_fu" | "unclefu" => Ok(Speaker::UncleFu),
-        "ono_anna" | "onoanna" => Ok(Speaker::OnoAnna),
-        "sohee" => Ok(Speaker::Sohee),
-        "eric" => Ok(Speaker::Eric),
-        "dylan" => Ok(Speaker::Dylan),
-        _ => anyhow::bail!("Unknown speaker: {}", name),
-    }
-}
-
-fn parse_language(name: &str) -> Result<Language> {
-    match name.to_lowercase().as_str() {
-        "english" | "en" => Ok(Language::English),
-        "chinese" | "zh" => Ok(Language::Chinese),
-        "japanese" | "ja" => Ok(Language::Japanese),
-        "korean" | "ko" => Ok(Language::Korean),
-        "german" | "de" => Ok(Language::German),
-        "french" | "fr" => Ok(Language::French),
-        "russian" | "ru" => Ok(Language::Russian),
-        "portuguese" | "pt" => Ok(Language::Portuguese),
-        "spanish" | "es" => Ok(Language::Spanish),
-        "italian" | "it" => Ok(Language::Italian),
-        _ => anyhow::bail!("Unknown language: {}", name),
-    }
-}
-
 /// Metadata for generated audio
 #[derive(Debug, Serialize, Deserialize)]
 struct GenerationMetadata {
@@ -228,9 +197,6 @@ fn run_voice_clone(args: &Args) -> Result<()> {
         println!("Mode: x_vector_only (no reference text)");
     }
 
-    // Set seed
-    generation::set_seed(args.seed);
-    generation::reset_rng();
     println!("Seed: {}", args.seed);
 
     let device = parse_device(&args.device)?;
@@ -263,7 +229,7 @@ fn run_voice_clone(args: &Args) -> Result<()> {
         );
     }
 
-    let language = parse_language(&args.language)?;
+    let language: Language = args.language.parse()?;
 
     // Calculate max frames from duration if specified
     let max_frames = if let Some(duration) = args.duration {
@@ -278,6 +244,7 @@ fn run_voice_clone(args: &Args) -> Result<()> {
         top_k: args.top_k,
         top_p: args.top_p,
         repetition_penalty: args.repetition_penalty,
+        seed: Some(args.seed),
         ..Default::default()
     };
 
@@ -318,7 +285,6 @@ fn run_voice_clone(args: &Args) -> Result<()> {
     audio.save(&output_path)?;
     println!("Saved WAV to: {}", output_path.display());
 
-    generation::clear_seed();
     println!("Generation complete!");
     Ok(())
 }
@@ -331,9 +297,6 @@ fn run_voice_design(args: &Args) -> Result<()> {
     println!("Text: {}", args.text);
     println!("Instruct: {}", instruct);
 
-    // Set seed
-    generation::set_seed(args.seed);
-    generation::reset_rng();
     println!("Seed: {}", args.seed);
 
     let device = parse_device(&args.device)?;
@@ -347,7 +310,7 @@ fn run_voice_design(args: &Args) -> Result<()> {
         );
     }
 
-    let language = parse_language(&args.language)?;
+    let language: Language = args.language.parse()?;
 
     // Calculate max frames from duration if specified
     let max_frames = if let Some(duration) = args.duration {
@@ -362,6 +325,7 @@ fn run_voice_design(args: &Args) -> Result<()> {
         top_k: args.top_k,
         top_p: args.top_p,
         repetition_penalty: args.repetition_penalty,
+        seed: Some(args.seed),
         ..Default::default()
     };
 
@@ -390,7 +354,6 @@ fn run_voice_design(args: &Args) -> Result<()> {
     audio.save(&output_path)?;
     println!("Saved WAV to: {}", output_path.display());
 
-    generation::clear_seed();
     println!("Generation complete!");
     Ok(())
 }
@@ -427,16 +390,9 @@ fn main() -> Result<()> {
     println!("Top-k: {}", args.top_k);
     println!("Top-p: {}", args.top_p);
 
-    // Set seed
-    generation::set_seed(args.seed);
-    println!(
-        "\nSeed set: {} (is_seeded: {})",
-        args.seed,
-        generation::is_seeded()
-    );
-
-    // Reset RNG to ensure deterministic starting point
-    generation::reset_rng();
+    // Create sampling context with deterministic seed
+    let mut sampling_ctx = generation::SamplingContext::new(Some(args.seed));
+    println!("\nSeed: {}", args.seed);
 
     let device = parse_device(&args.device)?;
     println!("Device: {}", device_info(&device));
@@ -568,8 +524,8 @@ fn main() -> Result<()> {
     let decoder = models::codec::Decoder12Hz::from_weights(&decoder_weights, Default::default())?;
 
     // Parse speaker and language for CustomVoice prefill
-    let speaker = parse_speaker(&args.speaker)?;
-    let language = parse_language(&args.language)?;
+    let speaker: Speaker = args.speaker.parse()?;
+    let language: Language = args.language.parse()?;
     println!("\nSpeaker: {:?}, Language: {:?}", speaker, language);
 
     // Build trailing text embeddings:
@@ -603,10 +559,10 @@ fn main() -> Result<()> {
         top_k: args.top_k,
         top_p: args.top_p,
         repetition_penalty: args.repetition_penalty,
-        eos_token_id: if args.compare {
-            None // Don't stop early when comparing with Python reference
-        } else {
+        eos_token_id: if !args.compare {
             Some(qwen3_tts::CODEC_EOS_TOKEN_ID)
+        } else {
+            None // Don't stop early when comparing with Python reference
         },
         min_new_tokens: 2,
     };
@@ -638,9 +594,12 @@ fn main() -> Result<()> {
     } else {
         logits_2d
     };
-    let logits_suppressed =
-        generation::apply_token_suppression(&logits_2d, 3072, qwen3_tts::CODEC_EOS_TOKEN_ID)?;
-    let first_token = generation::sample(&logits_suppressed, &gen_config)?;
+    let logits_suppressed = generation::apply_token_suppression(
+        &logits_2d,
+        qwen3_tts::codec_tokens::CODEC_VOCAB_SIZE,
+        qwen3_tts::CODEC_EOS_TOKEN_ID,
+    )?;
+    let first_token = generation::sample(&logits_suppressed, &gen_config, &mut sampling_ctx)?;
     let mut semantic_token: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
     generated_tokens.push(semantic_token);
     println!("First semantic token: {}", semantic_token);
@@ -718,9 +677,12 @@ fn main() -> Result<()> {
         } else {
             logits_2d
         };
-        let logits_suppressed =
-            generation::apply_token_suppression(&logits_2d, 3072, qwen3_tts::CODEC_EOS_TOKEN_ID)?;
-        let next_token = generation::sample(&logits_suppressed, &gen_config)?;
+        let logits_suppressed = generation::apply_token_suppression(
+            &logits_2d,
+            qwen3_tts::codec_tokens::CODEC_VOCAB_SIZE,
+            qwen3_tts::CODEC_EOS_TOKEN_ID,
+        )?;
+        let next_token = generation::sample(&logits_suppressed, &gen_config, &mut sampling_ctx)?;
         semantic_token = next_token.flatten_all()?.to_vec1::<u32>()?[0];
         generated_tokens.push(semantic_token);
     }
@@ -728,7 +690,7 @@ fn main() -> Result<()> {
     progress.finish_with_message("Done generating codes");
 
     // Convert to tensor [1, 16, num_frames]
-    let codes_tensor = codes_to_tensor(&all_codes, &device)?;
+    let codes_tensor = qwen3_tts::codes_to_tensor(&all_codes, &device)?;
     println!("\nCodes tensor shape: {:?}", codes_tensor.shape());
 
     // Save codes as binary
@@ -800,8 +762,6 @@ fn main() -> Result<()> {
         )?;
     }
 
-    // Clear seed
-    generation::clear_seed();
     println!("\nGeneration complete!");
 
     Ok(())
@@ -810,49 +770,27 @@ fn main() -> Result<()> {
 /// Load weights from safetensors file
 fn load_weights(path: &Path, device: &Device) -> Result<HashMap<String, Tensor>> {
     let tensors: HashMap<String, Tensor> = candle_core::safetensors::load(path, device)?;
-    let tensors: HashMap<String, Tensor> = tensors
-        .into_iter()
-        .map(|(name, tensor)| {
-            let converted = if tensor.dtype() == DType::BF16 {
-                tensor.to_dtype(DType::F32).unwrap()
-            } else {
-                tensor
-            };
-            (name, converted)
-        })
-        .collect();
-    Ok(tensors)
+    let mut converted = HashMap::with_capacity(tensors.len());
+    for (name, tensor) in tensors {
+        let t = if tensor.dtype() == DType::BF16 {
+            tensor.to_dtype(DType::F32)?
+        } else {
+            tensor
+        };
+        converted.insert(name, t);
+    }
+    Ok(converted)
 }
 
-/// Filter weights by prefix
+/// Filter weights by prefix, removing the prefix from keys.
 fn filter_weights(weights: &HashMap<String, Tensor>, prefix: &str) -> HashMap<String, Tensor> {
     weights
         .iter()
         .filter_map(|(k, v)| {
-            if k.starts_with(prefix) {
-                Some((k.strip_prefix(prefix).unwrap().to_string(), v.clone()))
-            } else {
-                None
-            }
+            k.strip_prefix(prefix)
+                .map(|stripped| (stripped.to_string(), v.clone()))
         })
         .collect()
-}
-
-/// Convert list of frame codes to tensor [batch, 16, num_frames]
-fn codes_to_tensor(codes: &[Vec<u32>], device: &Device) -> Result<Tensor> {
-    let num_frames = codes.len();
-    if num_frames == 0 {
-        return Ok(Tensor::zeros((1, 16, 0), DType::I64, device)?);
-    }
-
-    let mut data = vec![0i64; 16 * num_frames];
-    for (frame, frame_codes) in codes.iter().enumerate() {
-        for (q, &code) in frame_codes.iter().enumerate() {
-            data[q * num_frames + frame] = code as i64;
-        }
-    }
-
-    Ok(Tensor::from_vec(data, (1, 16, num_frames), device)?)
 }
 
 /// Save codes as binary (row-major: frame0_q0, frame0_q1, ..., frame1_q0, ...)

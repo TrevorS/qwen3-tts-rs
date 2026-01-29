@@ -8,13 +8,22 @@ license = "MIT"
 [features]
 default = ["cpu"]
 cpu = []
-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-flash-attn = ["cuda", "dep:candle-flash-attn"]
+cli = ["clap", "indicatif"]
+hub = ["hf-hub"]
+
+# All platform-portable features. Use `cargo lint` / `cargo check-all` / `cargo test-all`
+# instead of --all-features (which fails because platform-specific features conflict).
+all-portable = ["cpu", "cli", "hub"]
+
+# Platform-specific — enable manually based on your hardware:
+#   macOS:         metal, accelerate
+#   Linux + Intel: mkl
+#   Linux + NVIDIA: cuda, flash-attn
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
 mkl = ["candle-core/mkl", "candle-nn/mkl", "candle-transformers/mkl"]
-cli = ["clap", "indicatif"]
-hub = ["hf-hub"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+flash-attn = ["cuda", "dep:candle-flash-attn"]
 
 [dependencies]
 # Candle ML framework
@@ -24,15 +33,15 @@ candle-transformers = "0.9"
 candle-flash-attn = { version = "0.9", optional = true }
 
 # Tokenization (HuggingFace tokenizers in Rust)
-tokenizers = "0.21"
+tokenizers = "0.22"
 
 # Audio processing
 hound = "3.5"              # WAV I/O
-rubato = "0.16"            # High-quality resampling
+rubato = "1.0"            # High-quality resampling
 rustfft = "6.2"            # FFT for spectrograms
 
 # Serialization & model loading
-safetensors = "0.4"
+safetensors = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
@@ -48,13 +57,14 @@ num-complex = "0.4"
 
 # CLI (optional)
 clap = { version = "4.5", features = ["derive"], optional = true }
-indicatif = { version = "0.17", optional = true }
+indicatif = { version = "0.18", optional = true }
 
 # HuggingFace Hub (optional) - uses ureq sync client, no OpenSSL needed
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"], optional = true }
+audioadapter-buffers = "2.0.0"
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = "0.8"
 approx = "0.5"
 tempfile = "3.15"
 ndarray = "0.17.2"

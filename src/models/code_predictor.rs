@@ -88,23 +88,6 @@ impl CodePredictorConfig {
         }
     }
 
-    /// Create config from Qwen3TTS config
-    pub fn from_qwen3_tts(config: &Qwen3TTSConfig) -> Self {
-        Self {
-            hidden_size: config.hidden_size,
-            intermediate_size: config.intermediate_size,
-            num_hidden_layers: 5, // Fixed for code predictor
-            num_attention_heads: config.num_attention_heads,
-            num_key_value_heads: config.num_kv_heads(),
-            head_dim: config.head_dim(),
-            rms_norm_eps: config.rms_norm_eps,
-            rope_theta: config.rope_theta,
-            vocab_size: config.codebook_size,
-            num_code_groups: config.num_codebook_groups,
-            codec_embed_dim: None,
-        }
-    }
-
     /// Get the codec embedding dimension (defaults to hidden_size)
     pub fn codec_embed_dim(&self) -> usize {
         self.codec_embed_dim.unwrap_or(self.hidden_size)
@@ -232,49 +215,6 @@ impl CodePredictor {
         })
     }
 
-    /// Forward pass for prefill
-    ///
-    /// Takes the talker hidden state and previously generated codes,
-    /// returns hidden states for all positions.
-    pub fn forward_prefill(
-        &self,
-        talker_hidden: &Tensor,
-        codes: &[u32],
-        kv_caches: &mut [KVCache],
-    ) -> Result<Tensor> {
-        // Build input: [talker_hidden, embed(code_0), embed(code_1), ...]
-        let mut inputs = vec![talker_hidden.clone()];
-
-        for (i, &code) in codes.iter().enumerate() {
-            let code_tensor = Tensor::new(&[code], talker_hidden.device())?;
-            let embed = self.codec_embeddings[i].forward(&code_tensor)?;
-            inputs.push(embed.unsqueeze(0)?);
-        }
-
-        let hidden = Tensor::cat(&inputs, 1)?;
-
-        // Apply projection if needed (CustomVoice: 2048 -> 1024)
-        let hidden = if let Some(proj) = &self.small_to_mtp_projection {
-            proj.forward(&hidden)?
-        } else {
-            hidden
-        };
-
-        let seq_len = hidden.dim(1)?;
-
-        // Create causal mask
-        let mask = self.create_causal_mask(seq_len, talker_hidden.device())?;
-
-        // Run through layers
-        let mut hidden = hidden;
-        for (i, layer) in self.layers.iter().enumerate() {
-            hidden = layer.forward(&hidden, &self.rope, Some(&mask), Some(&mut kv_caches[i]), 0)?;
-        }
-
-        // Final norm
-        Ok(self.norm.forward(&hidden)?)
-    }
-
     /// Generate next token logits for a specific group
     ///
     /// # Arguments
@@ -378,17 +318,7 @@ impl CodePredictor {
     }
 
     fn create_causal_mask(&self, seq_len: usize, device: &candle_core::Device) -> Result<Tensor> {
-        let mut mask_data = vec![0.0f32; seq_len * seq_len];
-        for i in 0..seq_len {
-            for j in (i + 1)..seq_len {
-                mask_data[i * seq_len + j] = f32::NEG_INFINITY;
-            }
-        }
-        Ok(Tensor::from_vec(
-            mask_data,
-            (1, 1, seq_len, seq_len),
-            device,
-        )?)
+        super::transformer::create_causal_mask(seq_len, 0, device)
     }
 
     /// Get acoustic code embedding for a specific group
@@ -452,16 +382,14 @@ impl CodePredictor {
             );
         }
 
-        let mut sum: Option<Tensor> = None;
-        for (i, &code) in acoustic_codes.iter().enumerate() {
-            let embed = self.get_acoustic_embedding(code, i, device)?;
-            sum = Some(match sum {
-                Some(s) => s.add(&embed)?,
-                None => embed,
-            });
-        }
-
-        Ok(sum.unwrap())
+        let first = self.get_acoustic_embedding(acoustic_codes[0], 0, device)?;
+        acoustic_codes[1..]
+            .iter()
+            .enumerate()
+            .try_fold(first, |acc, (i, &code)| {
+                let embed = self.get_acoustic_embedding(code, i + 1, device)?;
+                acc.add(&embed).map_err(Into::into)
+            })
     }
 }
 
@@ -482,26 +410,6 @@ mod tests {
         assert_eq!(config.num_hidden_layers, 5);
         assert_eq!(config.num_code_groups, 16);
         assert_eq!(config.hidden_size, 1024);
-    }
-
-    #[test]
-    fn test_config_from_qwen3_tts() {
-        let qwen_config = Qwen3TTSConfig {
-            hidden_size: 1024,
-            num_attention_heads: 16,
-            num_key_value_heads: Some(8),
-            head_dim_override: Some(128),
-            num_codebook_groups: 16,
-            codebook_size: 2048,
-            ..Default::default()
-        };
-
-        let config = CodePredictorConfig::from_qwen3_tts(&qwen_config);
-        assert_eq!(config.hidden_size, 1024);
-        assert_eq!(config.num_attention_heads, 16);
-        assert_eq!(config.num_key_value_heads, 8);
-        assert_eq!(config.head_dim, 128);
-        assert_eq!(config.num_code_groups, 16);
     }
 
     #[test]

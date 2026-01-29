@@ -39,8 +39,11 @@ fn main() -> Result<()> {
         codes.len(),
         &semantic_tokens
     );
-    let has_eos = semantic_tokens.contains(&2150);
-    eprintln!("Contains EOS (2150): {has_eos}");
+    let has_eos = semantic_tokens.contains(&qwen3_tts::CODEC_EOS_TOKEN_ID);
+    eprintln!(
+        "Contains EOS ({}): {has_eos}",
+        qwen3_tts::CODEC_EOS_TOKEN_ID
+    );
     eprintln!(
         "ICL clone: {:.2}s, {} samples → output_clone_icl.wav",
         audio.duration(),

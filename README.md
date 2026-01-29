@@ -1,6 +1,6 @@
 # qwen3-tts
 
-Pure Rust inference for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS), a high-quality text-to-speech model from Alibaba.
+Pure Rust inference for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS), a high-quality text-to-speech model from Alibaba. Built on [candle](https://github.com/huggingface/candle) for zero-dependency ML inference — no Python, no ONNX, no C++ bindings.
 
 ## Features
 
@@ -13,6 +13,40 @@ Pure Rust inference for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS), a high
 - **Text-described voices** via natural language prompts (VoiceDesign models)
 - **Auto-detection** of model variant from `config.json`
 - **HuggingFace Hub integration** for easy model downloads
+
+## Samples
+
+All samples generated with 1.7B models, seed 42. Text: *"The sun set behind the mountains, painting the sky in shades of gold and violet."*
+
+### CustomVoice — Ryan
+
+![CustomVoice Ryan](assets/images/customvoice-ryan.png)
+[🔊 Listen](assets/audio/customvoice-ryan.wav)
+
+### CustomVoice — Serena
+
+![CustomVoice Serena](assets/images/customvoice-serena.png)
+[🔊 Listen](assets/audio/customvoice-serena.wav)
+
+### Voice Clone — ICL
+
+![Voice Clone ICL](assets/images/voiceclone-icl.png)
+[🔊 Listen](assets/audio/voiceclone-icl.wav)
+
+### VoiceDesign — Radio Announcer
+
+![VoiceDesign Radio](assets/images/voicedesign-radio.png)
+[🔊 Listen](assets/audio/voicedesign-radio.wav)
+
+### VoiceDesign — Storyteller
+
+![VoiceDesign Storyteller](assets/images/voicedesign-storyteller.png)
+[🔊 Listen](assets/audio/voicedesign-storyteller.wav)
+
+### VoiceDesign — Sportscaster
+
+![VoiceDesign Sportscaster](assets/images/voicedesign-sportscaster.png)
+[🔊 Listen](assets/audio/voicedesign-sportscaster.wav)
 
 ## Model Variants
 
@@ -212,9 +246,9 @@ The TTS pipeline consists of three stages:
 
 1. **TalkerModel**: 28-layer transformer generating semantic tokens from text autoregressively. Uses MRoPE (multimodal rotary position encoding) across all variants.
 
-2. **CodePredictor**: 5-layer decoder that generates 15 acoustic tokens per semantic token. Always 1024 hidden dim; 1.7B models use a projection layer to bridge from the talker's 2048-dim space.
+1. **CodePredictor**: 5-layer decoder that generates 15 acoustic tokens per semantic token. Always 1024 hidden dim; 1.7B models use a projection layer to bridge from the talker's 2048-dim space.
 
-3. **Decoder12Hz**: Converts 16-codebook tokens to 24kHz audio via ConvNeXt blocks and transposed convolution upsampling. Shared across all model variants.
+1. **Decoder12Hz**: Converts 16-codebook tokens to 24kHz audio via ConvNeXt blocks and transposed convolution upsampling. Shared across all model variants.
 
 ```
 Text --> TalkerModel --> Semantic Token --> CodePredictor --> [16 codes] --> Decoder --> Audio

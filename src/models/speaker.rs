@@ -27,7 +27,7 @@ fn reflect_pad_1d(x: &Tensor, pad_left: usize, pad_right: usize) -> Result<Tenso
     if pad_left == 0 && pad_right == 0 {
         return Ok(x.clone());
     }
-    // index_select requires contiguous tensors
+
     let x = &x.contiguous()?;
     let (_b, _c, t) = x.dims3()?;
 
