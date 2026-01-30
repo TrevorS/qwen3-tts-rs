@@ -27,6 +27,21 @@ All code in this repo was written with [Claude Code](https://claude.ai/code). Th
 - **Auto-detection** of model variant from `config.json`
 - **HuggingFace Hub integration** for easy model downloads
 
+## Performance
+
+Benchmarked on an NVIDIA DGX Spark (GB10 Blackwell, ARM Cortex-X925, 120 GB unified memory).
+1.7B CustomVoice model, default generation parameters, seed 42.
+
+| Device | RTF (short) | RTF (long) | Tok/s | TTFA | Memory |
+|--------|-------------|------------|-------|------|--------|
+| **CUDA (BF16)** | **0.78** | **0.81** | 16.0 | 630 ms | 765 MB |
+| CPU (F32) | 5.39 | 6.48 | 2.1 | — | 9.1 GB |
+
+RTF (real-time factor) = wall-clock / audio duration. **< 1.0 is faster than real-time.**
+TTFA = time to first audio chunk via streaming.
+
+See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for full results, test corpus, micro-benchmarks, and reproduction instructions.
+
 ## Samples
 
 All samples generated with 1.7B models, seed 42. Text: *"The sun set behind the mountains, painting the sky in shades of gold and violet."*

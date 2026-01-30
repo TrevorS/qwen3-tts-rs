@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Pure Rust inference for Qwen3-TTS"
 license = "MIT"
+autobenches = false
 
 [features]
 default = ["cpu"]
@@ -73,6 +74,23 @@ ndarray-npy = "0.10.0"
 [[bin]]
 name = "generate_audio"
 path = "src/bin/generate_audio.rs"
+required-features = ["cli"]
+
+[[bench]]
+name = "sampling"
+harness = false
+
+[[bench]]
+name = "audio"
+harness = false
+
+[[bench]]
+name = "tensor_ops"
+harness = false
+
+[[bin]]
+name = "e2e_bench"
+path = "benches/e2e_bench.rs"
 required-features = ["cli"]
 
 [profile.release]
