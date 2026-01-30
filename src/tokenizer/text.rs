@@ -48,31 +48,40 @@ fn create_mock_tokenizer() -> Tokenizer {
 }
 
 impl TextTokenizer {
-    /// Load tokenizer from a HuggingFace model ID or local path
+    /// Load tokenizer from a local path or HuggingFace model ID.
+    ///
+    /// Accepts a directory containing `tokenizer.json`, a direct file path,
+    /// or a HuggingFace repo ID (e.g. `"Qwen/Qwen2-0.5B"`).
     pub fn from_pretrained(model_id: &str) -> Result<Self> {
-        // Try local path first
-        let tokenizer_path = Path::new(model_id).join("tokenizer.json");
-        if tokenizer_path.exists() {
-            return Self::from_file(&tokenizer_path);
+        let path = Path::new(model_id);
+
+        // Direct file path
+        if path.is_file() {
+            return Self::from_file(path);
         }
 
-        // Try downloading from HuggingFace Hub
+        // Directory containing tokenizer.json
+        let tokenizer_json = path.join("tokenizer.json");
+        if tokenizer_json.exists() {
+            return Self::from_file(&tokenizer_json);
+        }
+
+        // HF Hub download via hf-hub
         #[cfg(feature = "hub")]
         {
             tracing::info!("Downloading tokenizer from HuggingFace Hub: {}", model_id);
             let api = hf_hub::api::sync::Api::new()
-                .map_err(|e| anyhow!("Failed to create HuggingFace API client: {}", e))?;
-            let repo = api.model(model_id.to_string());
-            let tokenizer_file = repo
+                .map_err(|e| anyhow!("Failed to create HuggingFace API: {}", e))?;
+            let file = api
+                .model(model_id.to_string())
                 .get("tokenizer.json")
-                .map_err(|e| anyhow!("Failed to download tokenizer.json: {}", e))?;
-            Self::from_file(&tokenizer_file)
+                .map_err(|e| anyhow!("Failed to download tokenizer '{}': {}", model_id, e))?;
+            return Self::from_file(&file);
         }
 
         #[cfg(not(feature = "hub"))]
         Err(anyhow!(
-            "Remote tokenizer loading requires the `hub` feature. \
-             Either enable it or download the tokenizer locally first: {}",
+            "No tokenizer found at '{}' and hub feature is disabled",
             model_id
         ))
     }

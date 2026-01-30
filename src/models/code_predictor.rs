@@ -226,19 +226,48 @@ impl CodePredictor {
         Ok(self.lm_heads[group_idx].forward(&pos_hidden)?)
     }
 
-    /// Generate all 15 acoustic tokens autoregressively
+    /// Run a prefill pass through the code predictor transformer layers.
+    ///
+    /// Takes pre-built hidden states (e.g. talker_hidden concatenated with code
+    /// embeddings), runs through all layers with KV caches, and returns the
+    /// normed hidden states. Use `get_logits` to extract per-group predictions.
+    ///
+    /// This is a low-level method for reference validation.
+    pub fn forward_prefill(
+        &self,
+        hidden: &Tensor,
+        _prev_codes: &[u32],
+        kv_caches: &mut [KVCache],
+    ) -> Result<Tensor> {
+        let device = hidden.device();
+        let input = if let Some(proj) = &self.small_to_mtp_projection {
+            proj.forward(hidden)?
+        } else {
+            hidden.clone()
+        };
+
+        let seq_len = input.dim(1)?;
+        let mask = self.create_causal_mask(seq_len, device)?;
+
+        let mut h = input;
+        for (i, layer) in self.layers.iter().enumerate() {
+            h = layer.forward(&h, &self.rope, Some(&mask), Some(&mut kv_caches[i]), 0)?;
+        }
+        Ok(self.norm.forward(&h)?)
+    }
+
+    /// Generate all 15 acoustic tokens autoregressively.
     ///
     /// Each acoustic code is predicted conditioned on the talker hidden state,
     /// the semantic token embedding, and all previously generated acoustic codes.
-    /// This matches the official Qwen3-TTS architecture where the code predictor
-    /// uses KV caching for sequential generation.
+    /// Uses KV caching for sequential generation.
     ///
     /// # Arguments
-    /// * `talker_hidden` - Hidden state from talker model, shape [batch, 1, hidden]
-    /// * `semantic_embed` - Embedding of semantic token, shape [batch, 1, hidden]
+    /// * `talker_hidden` - Hidden state from talker model, shape `[batch, 1, hidden]`
+    /// * `semantic_embed` - Embedding of semantic token, shape `[batch, 1, hidden]`
     ///
     /// # Returns
-    /// Vector of 15 acoustic token IDs
+    /// Vector of 15 acoustic token IDs.
     pub fn generate_acoustic_codes(
         &self,
         talker_hidden: &Tensor,

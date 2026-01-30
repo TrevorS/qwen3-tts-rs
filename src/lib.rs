@@ -159,7 +159,23 @@ impl Qwen3TTS {
     ///
     /// Auto-detects the model variant (0.6B/1.7B, Base/CustomVoice/VoiceDesign)
     /// from `config.json` if present, falling back to weight inspection.
+    ///
+    /// The text tokenizer is resolved from `model_id/tokenizer.json` if present,
+    /// otherwise downloaded from HuggingFace Hub. Use `tokenizer_id` to override.
     pub fn from_pretrained(model_id: &str, device: Device) -> Result<Self> {
+        Self::from_pretrained_with_tokenizer(model_id, None, device)
+    }
+
+    /// Load a model with an explicit tokenizer source.
+    ///
+    /// `tokenizer_id` can be a local directory, a file path, or a HuggingFace
+    /// model ID (e.g. `"Qwen/Qwen2-0.5B"`). If `None`, resolves from the
+    /// model directory or falls back to the default tokenizer repo.
+    pub fn from_pretrained_with_tokenizer(
+        model_id: &str,
+        tokenizer_id: Option<&str>,
+        device: Device,
+    ) -> Result<Self> {
         tracing::info!("Loading Qwen3-TTS from: {}", model_id);
         tracing::info!("Compute dtype: {:?}", compute_dtype_for_device(&device));
 
@@ -184,7 +200,8 @@ impl Qwen3TTS {
         };
 
         // Load text tokenizer
-        let text_tokenizer = tokenizer::TextTokenizer::from_pretrained(model_id)?;
+        let tok_source = tokenizer_id.unwrap_or(model_id);
+        let text_tokenizer = tokenizer::TextTokenizer::from_pretrained(tok_source)?;
 
         // Load model weights
         let model_path = Path::new(model_id).join("model.safetensors");

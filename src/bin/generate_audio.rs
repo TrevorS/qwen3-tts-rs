@@ -134,6 +134,30 @@ struct GenerationMetadata {
     sample_rate: u32,
 }
 
+/// Calculate max frames from --duration or --frames.
+fn max_frames_from_args(args: &Args) -> usize {
+    if let Some(duration) = args.duration {
+        (duration * 12.5) as usize
+    } else {
+        args.frames
+    }
+}
+
+/// Resolve output WAV path from --output or default naming in --output-dir.
+fn resolve_output_path(args: &Args, max_frames: usize) -> Result<std::path::PathBuf> {
+    let path = if let Some(ref out) = args.output {
+        std::path::PathBuf::from(out)
+    } else {
+        let output_dir = Path::new(&args.output_dir);
+        fs::create_dir_all(output_dir)?;
+        output_dir.join(format!("audio_seed{}_frames{}.wav", args.seed, max_frames))
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    Ok(path)
+}
+
 /// Validate CLI arg combinations and bail early on contradictory flags.
 fn validate_args(args: &Args) -> Result<()> {
     // --instruct and --ref-audio are mutually exclusive
@@ -203,7 +227,11 @@ fn run_voice_clone(args: &Args) -> Result<()> {
 
     let device = parse_device(&args.device)?;
     println!("Device: {}", device_info(&device));
-    let model = Qwen3TTS::from_pretrained(&args.model_dir, device)?;
+    let model = Qwen3TTS::from_pretrained_with_tokenizer(
+        &args.model_dir,
+        args.tokenizer_dir.as_deref(),
+        device,
+    )?;
 
     // Load reference audio
     let ref_audio = AudioBuffer::load(ref_audio_path)?;
@@ -232,13 +260,7 @@ fn run_voice_clone(args: &Args) -> Result<()> {
     }
 
     let language: Language = args.language.parse()?;
-
-    // Calculate max frames from duration if specified
-    let max_frames = if let Some(duration) = args.duration {
-        (duration * 12.5) as usize
-    } else {
-        args.frames
-    };
+    let max_frames = max_frames_from_args(args);
 
     let options = SynthesisOptions {
         max_length: max_frames,
@@ -270,20 +292,7 @@ fn run_voice_clone(args: &Args) -> Result<()> {
         has_eos
     );
 
-    // Determine output path
-    let output_path = if let Some(ref out) = args.output {
-        std::path::PathBuf::from(out)
-    } else {
-        let output_dir = Path::new(&args.output_dir);
-        fs::create_dir_all(output_dir)?;
-        output_dir.join(format!("audio_seed{}_frames{}.wav", args.seed, max_frames))
-    };
-
-    // Ensure parent directory exists
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
+    let output_path = resolve_output_path(args, max_frames)?;
     audio.save(&output_path)?;
     println!("Saved WAV to: {}", output_path.display());
 
@@ -303,7 +312,11 @@ fn run_voice_design(args: &Args) -> Result<()> {
 
     let device = parse_device(&args.device)?;
     println!("Device: {}", device_info(&device));
-    let model = Qwen3TTS::from_pretrained(&args.model_dir, device)?;
+    let model = Qwen3TTS::from_pretrained_with_tokenizer(
+        &args.model_dir,
+        args.tokenizer_dir.as_deref(),
+        device,
+    )?;
 
     if !model.supports_voice_design() {
         eprintln!(
@@ -313,13 +326,7 @@ fn run_voice_design(args: &Args) -> Result<()> {
     }
 
     let language: Language = args.language.parse()?;
-
-    // Calculate max frames from duration if specified
-    let max_frames = if let Some(duration) = args.duration {
-        (duration * 12.5) as usize
-    } else {
-        args.frames
-    };
+    let max_frames = max_frames_from_args(args);
 
     let options = SynthesisOptions {
         max_length: max_frames,
@@ -339,20 +346,7 @@ fn run_voice_design(args: &Args) -> Result<()> {
         audio.len()
     );
 
-    // Determine output path
-    let output_path = if let Some(ref out) = args.output {
-        std::path::PathBuf::from(out)
-    } else {
-        let output_dir = Path::new(&args.output_dir);
-        fs::create_dir_all(output_dir)?;
-        output_dir.join(format!("audio_seed{}_frames{}.wav", args.seed, max_frames))
-    };
-
-    // Ensure parent directory exists
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
+    let output_path = resolve_output_path(args, max_frames)?;
     audio.save(&output_path)?;
     println!("Saved WAV to: {}", output_path.display());
 
@@ -377,12 +371,7 @@ fn main() -> Result<()> {
         return run_voice_design(&args);
     }
 
-    // Calculate frames from duration if specified
-    let num_frames = if let Some(duration) = args.duration {
-        (duration * 12.5) as usize
-    } else {
-        args.frames
-    };
+    let num_frames = max_frames_from_args(&args);
 
     println!("=== Generating Audio (Rust) ===");
     println!("Text: {}", args.text);

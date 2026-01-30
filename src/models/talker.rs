@@ -789,6 +789,41 @@ impl TalkerModel {
         Ok(Some(first_text_proj.add(codec_bos_embed)?))
     }
 
+    /// Raw forward pass: embed input_ids and run through all layers.
+    ///
+    /// Returns logits for the full sequence (no KV cache).
+    /// This is a low-level method for reference validation; prefer the
+    /// mode-specific prefill methods for actual generation.
+    pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
+        let embed = self.text_embedding.forward(input_ids)?;
+        let projected = self.text_projection.forward(&embed)?;
+
+        let seq_len = projected.dim(1)?;
+        let mask = self.create_causal_mask(seq_len, 0)?;
+
+        let mut hidden = projected;
+        for layer in &self.layers {
+            hidden = layer.forward(&hidden, &self.rope, Some(&mask), None, 0)?;
+        }
+        hidden = self.norm.forward(&hidden)?;
+        Ok(self.codec_head.forward(&hidden)?)
+    }
+
+    /// Raw prefill: embed input_ids, run through layers, populate KV caches.
+    ///
+    /// Returns `(hidden_states, logits)` where logits are for the last position only.
+    /// This is a low-level method for reference validation; prefer the
+    /// mode-specific prefill methods for actual generation.
+    pub fn prefill(
+        &self,
+        input_ids: &Tensor,
+        kv_caches: &mut [KVCache],
+    ) -> Result<(Tensor, Tensor)> {
+        let embed = self.text_embedding.forward(input_ids)?;
+        let projected = self.text_projection.forward(&embed)?;
+        self.run_prefill_layers(projected, kv_caches)
+    }
+
     /// Run prefill through all layers: causal mask → layers → norm → logits.
     ///
     /// Returns `(hidden_states, logits)` for the full sequence.
