@@ -13,8 +13,8 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    eprintln!("\n=== Apollo 11 ===");
-    let ref_audio = AudioBuffer::load("examples/data/apollo11_one_small_step.wav")?;
+    eprintln!("\n=== Clone 2 ===");
+    let ref_audio = AudioBuffer::load("examples/data/clone_2.wav")?;
     let prompt1 = model.create_voice_clone_prompt(&ref_audio, None)?;
     let _ =
         model.synthesize_voice_clone(text, &prompt1, Language::English, Some(options.clone()))?;

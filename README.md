@@ -4,9 +4,18 @@ Pure Rust inference for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS), a text
 
 All code in this repo was written with [Claude Code](https://claude.ai/code). This is an experiment -- not a production library.
 
-## Known Issues
+## Changelog
 
-- **ICL voice cloning produces malformed audio.** The x-vector-only cloning path works well. ICL (in-context learning) mode does not. Use `--x-vector-only` with `--ref-audio`, or use CustomVoice/VoiceDesign models instead.
+### 0.2.0
+
+- ICL voice cloning now works correctly with proper reference audio
+- Fixed WAV output format (WAVEX/float32 → standard WAV/PCM16) — resolves playback speed issues in some players
+- Improved tokenizer path resolution with explicit `--tokenizer-dir` override
+- Added benchmarking suite (Criterion micro-benchmarks + E2E speed tests)
+- Automatic resampling of reference audio to 24kHz for voice cloning
+- Docker base image updated to NGC pytorch:25.11 (CUDA 13.0)
+
+Thanks to [u/rngesius](https://www.reddit.com/r/LocalLLaMA/comments/1qqvb79/comment/o2nv6qm/) for feedback on playback speed and tokenizer issues.
 
 ## Acknowledgements
 
@@ -21,7 +30,7 @@ All code in this repo was written with [Claude Code](https://claude.ai/code). Th
 - **CUDA** support for NVIDIA GPU acceleration with **bf16** and **Flash Attention 2**
 - **Metal** support for Apple Silicon
 - **Streaming synthesis** for low-latency audio output
-- **Voice cloning** via x-vector from reference audio (Base models; ICL mode is broken — see Known Issues)
+- **Voice cloning** via x-vector or ICL (in-context learning) from reference audio (Base models)
 - **Preset speakers** with 9 built-in voices (CustomVoice models)
 - **Text-described voices** via natural language prompts (VoiceDesign models)
 - **Auto-detection** of model variant from `config.json`
@@ -56,6 +65,11 @@ All samples generated with 1.7B models, seed 42. Text: *"The sun set behind the 
 ![CustomVoice Serena](assets/images/customvoice-serena.png)
 [🔊 Listen](assets/audio/customvoice-serena.wav)
 
+### Voice Clone — ICL
+
+![Voice Clone ICL](assets/images/voiceclone-icl.png)
+[🔊 Listen](assets/audio/voiceclone-icl.wav)
+
 ### VoiceDesign — Radio Announcer
 
 ![VoiceDesign Radio](assets/images/voicedesign-radio.png)
@@ -85,7 +99,7 @@ Five official model variants exist across two size classes. Each variant support
 
 ### Which model should I use?
 
-- **Want to clone a specific voice?** Use a **Base** model with `--ref-audio --x-vector-only`. (ICL mode is broken.)
+- **Want to clone a specific voice?** Use a **Base** model with `--ref-audio` (ICL mode) or `--ref-audio --x-vector-only` (faster, lower quality).
 - **Want a quick preset voice?** Use a **CustomVoice** model with `--speaker`.
 - **Want to describe a voice in text?** Use **1.7B VoiceDesign** with `--instruct`.
 - **Unsure?** Start with **0.6B CustomVoice** for the fastest results.
@@ -94,7 +108,7 @@ Five official model variants exist across two size classes. Each variant support
 
 | | Preset speakers | Voice clone (x_vector) | Voice clone (ICL) | Text-described voice |
 |---|:-:|:-:|:-:|:-:|
-| **Base** | | x | ⚠️ broken | |
+| **Base** | | x | x | |
 | **CustomVoice** | x | | | |
 | **VoiceDesign** | | | | x |
 
@@ -158,11 +172,11 @@ fn main() -> anyhow::Result<()> {
     // Load reference audio
     let ref_audio = AudioBuffer::load("reference_voice.wav")?;
 
-    // x_vector_only: speaker embedding from reference audio
-    let prompt = model.create_voice_clone_prompt(&ref_audio, None)?;
+    // ICL mode: full voice cloning with reference text
+    let prompt = model.create_voice_clone_prompt(&ref_audio, Some("transcript of ref audio"))?;
 
-    // ICL mode (currently broken — produces garbage audio):
-    // let prompt = model.create_voice_clone_prompt(&ref_audio, Some("transcript of ref audio"))?;
+    // x_vector_only: faster, speaker embedding only (no reference text needed)
+    // let prompt = model.create_voice_clone_prompt(&ref_audio, None)?;
 
     let audio = model.synthesize_voice_clone(
         "Hello in the cloned voice!",
@@ -292,18 +306,19 @@ cargo run --release --features cli --bin generate_audio -- \
   --speaker ryan \
   --language english \
 
-# Base: voice cloning (x_vector_only)
+# Base: voice cloning (ICL — best quality, requires reference text)
 cargo run --release --features cli --bin generate_audio -- \
   --model-dir path/to/base \
   --text "Hello world" \
-  --ref-audio reference.wav
+  --ref-audio reference.wav \
+  --ref-text "transcript of the reference audio"
 
-# Base: voice cloning (ICL — currently broken, produces garbage audio)
-# cargo run --release --features cli --bin generate_audio -- \
-#   --model-dir path/to/base \
-#   --text "Hello world" \
-#   --ref-audio reference.wav \
-#   --ref-text "transcript of the reference audio"
+# Base: voice cloning (x_vector_only — faster, no transcript needed)
+cargo run --release --features cli --bin generate_audio -- \
+  --model-dir path/to/base \
+  --text "Hello world" \
+  --ref-audio reference.wav \
+  --x-vector-only
 
 # VoiceDesign: describe the voice you want
 cargo run --release --features cli --bin generate_audio -- \
@@ -329,7 +344,7 @@ cargo run --release --features cli --bin generate_audio -- \
 | `--language` | `english` | Target language |
 | `--instruct` | | Voice description for VoiceDesign models |
 | `--ref-audio` | | Reference audio WAV for voice cloning (Base only) |
-| `--ref-text` | | Reference transcript for ICL mode (broken) |
+| `--ref-text` | | Reference transcript for ICL voice cloning (requires `--ref-audio`) |
 | `--x-vector-only` | | Speaker embedding only, no ICL (use with `--ref-audio`) |
 | `--output` | | Output WAV file path (overrides default naming) |
 | `--device` | `auto` | Device: `auto`, `cpu`, `cuda`, `cuda:N`, `metal` |

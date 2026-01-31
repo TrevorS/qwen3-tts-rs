@@ -274,8 +274,8 @@ def build_test_matrix(
     repo_root: Path,
     instruct_text: str,
 ) -> list[TestCase]:
-    ref_audio = repo_root / "examples" / "data" / "apollo11_one_small_step.wav"
-    ref_text = "That's one small step for man, one giant leap for mankind."
+    ref_audio = repo_root / "examples" / "data" / "clone_2.wav"
+    ref_text = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
     tests: list[TestCase] = []
 
     for m in models:
@@ -701,8 +701,8 @@ def run_readme_samples(
         if m.model_type not in model_by_type:
             model_by_type[m.model_type] = m
 
-    ref_audio = repo_root / "examples" / "data" / "apollo11_one_small_step.wav"
-    ref_text = "That's one small step for man, one giant leap for mankind."
+    ref_audio = repo_root / "examples" / "data" / "clone_2.wav"
+    ref_text = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 
     total = len(README_SAMPLES)
     for i, sample in enumerate(README_SAMPLES):

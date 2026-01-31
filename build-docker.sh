@@ -12,7 +12,7 @@ set -e
 IMAGE_NAME="${1:-qwen3-tts}"
 FEATURES="${2:-flash-attn,cli}"
 CONTAINER_NAME="qwen3-tts-builder-$$"
-BASE_IMAGE="nvcr.io/nvidia/pytorch:25.12-py3"
+BASE_IMAGE="nvcr.io/nvidia/pytorch:25.11-py3"
 
 echo "=== Building $IMAGE_NAME with features: $FEATURES ==="
 
@@ -42,14 +42,19 @@ echo "Building with features: $FEATURES"
 docker exec "$CONTAINER_NAME" bash -c \
     "source ~/.cargo/env && cd /workspace/project && cargo build --release --features '$FEATURES'"
 
-# Install binary to system path
+# Install binary and Python tools
 echo "Installing binary..."
 docker exec "$CONTAINER_NAME" bash -c \
     'cp /workspace/project/target/release/generate_audio /usr/local/bin/ && \
      mkdir -p /examples/data && \
-     cp /workspace/project/examples/data/apollo11_one_small_step.wav /examples/data/ 2>/dev/null || true && \
+     cp /workspace/project/examples/data/clone_2.wav /examples/data/ 2>/dev/null || true && \
+     cp /workspace/project/scripts/transcribe.py /usr/local/bin/ 2>/dev/null || true && \
      mkdir -p /output && \
      rm -rf /workspace/project'
+
+echo "Installing Python tools (whisper, flash-attn)..."
+docker exec "$CONTAINER_NAME" bash -c \
+    'pip install --no-cache-dir openai-whisper scipy flash-attn'
 
 # Commit to new image
 echo "Creating image..."

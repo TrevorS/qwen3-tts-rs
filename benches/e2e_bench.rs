@@ -3,12 +3,14 @@
 //! Measures wall-clock time, RTF, tokens/sec, and optionally TTFA via streaming.
 //!
 //! Usage:
-//!     cargo run --release --features cli --bin e2e_bench -- \
-//!         --model-dir test_data --device auto --iterations 3
+//! ```sh
+//! cargo run --release --features cli --bin e2e_bench -- \
+//!     --model-dir test_data --device auto --iterations 3
 //!
-//!     # With JSON output:
-//!     cargo run --release --features cli --bin e2e_bench -- \
-//!         --model-dir test_data --json-output results.json
+//! # With JSON output:
+//! cargo run --release --features cli --bin e2e_bench -- \
+//!     --model-dir test_data --json-output results.json
+//! ```
 
 use anyhow::Result;
 use clap::Parser;

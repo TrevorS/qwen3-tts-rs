@@ -56,12 +56,9 @@ fn main() -> Result<()> {
 
     // ── 4. Voice cloning ────────────────────────────────────────────
     //
-    // Reference clip: Apollo 11 — Neil Armstrong stepping onto the Moon.
-    // Public domain (NASA/US government work).
-    // Note: the radio transmission artifacts will carry into the clone.
-    // For best results, use clean studio-quality reference audio.
+    // Reference clip: official Qwen3-TTS test audio (clone_2.wav)
     if model.supports_voice_cloning() {
-        let ref_audio = AudioBuffer::load("examples/data/apollo11_one_small_step.wav")?;
+        let ref_audio = AudioBuffer::load("examples/data/clone_2.wav")?;
 
         // x_vector_only mode: speaker embedding only
         let prompt = model.create_voice_clone_prompt(&ref_audio, None)?;
@@ -79,9 +76,8 @@ fn main() -> Result<()> {
 
         // ICL mode: speaker embedding + reference audio codes + transcript
         if model.has_speech_encoder() {
-            let ref_text = "I'm going to step off the LM now. \
-                            That's one small step for man, \
-                            one giant leap for mankind.";
+            let ref_text = "Okay. Yeah. I resent you. I love you. I respect you. \
+                            But you know what? You blew it! And thanks to you.";
             let prompt = model.create_voice_clone_prompt(&ref_audio, Some(ref_text))?;
             let audio = model.synthesize_voice_clone(
                 "We choose to go to the Moon in this decade.",

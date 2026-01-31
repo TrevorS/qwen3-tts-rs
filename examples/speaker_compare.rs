@@ -16,11 +16,11 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    let ref_audio = AudioBuffer::load("examples/data/apollo11_one_small_step.wav")?;
+    let ref_audio = AudioBuffer::load("examples/data/clone_2.wav")?;
     let prompt1 = model.create_voice_clone_prompt(&ref_audio, None)?;
     let audio1 =
         model.synthesize_voice_clone(text, &prompt1, Language::English, Some(options.clone()))?;
-    eprintln!("Apollo: {} samples", audio1.len());
+    eprintln!("Clone2: {} samples", audio1.len());
 
     let sine: Vec<f32> = (0..24000 * 3)
         .map(|i| (i as f32 * 440.0 * 2.0 * std::f32::consts::PI / 24000.0).sin() * 0.5)
@@ -36,7 +36,7 @@ fn main() -> Result<()> {
         .zip(&audio2.samples)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
-    eprintln!("Max diff (Apollo vs Sine, temp=0): {:.6}", max_diff);
+    eprintln!("Max diff (Clone2 vs Sine, temp=0): {:.6}", max_diff);
 
     // Test 2: Voice clone with temperature=0.7
     eprintln!("\n=== Test 2: Voice clone, temperature=0.7 ===");
@@ -47,7 +47,7 @@ fn main() -> Result<()> {
     };
     let audio3 =
         model.synthesize_voice_clone(text, &prompt1, Language::English, Some(options2.clone()))?;
-    eprintln!("Apollo t=0.7: {} samples", audio3.len());
+    eprintln!("Clone2 t=0.7: {} samples", audio3.len());
     let audio4 = model.synthesize_voice_clone(text, &prompt2, Language::English, Some(options2))?;
     eprintln!("Sine t=0.7: {} samples", audio4.len());
 
@@ -57,7 +57,7 @@ fn main() -> Result<()> {
         .zip(&audio4.samples)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
-    eprintln!("Max diff (Apollo vs Sine, temp=0.7): {:.6}", max_diff2);
+    eprintln!("Max diff (Clone2 vs Sine, temp=0.7): {:.6}", max_diff2);
 
     Ok(())
 }

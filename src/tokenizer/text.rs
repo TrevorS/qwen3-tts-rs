@@ -76,7 +76,7 @@ impl TextTokenizer {
                 .model(model_id.to_string())
                 .get("tokenizer.json")
                 .map_err(|e| anyhow!("Failed to download tokenizer '{}': {}", model_id, e))?;
-            return Self::from_file(&file);
+            Self::from_file(&file)
         }
 
         #[cfg(not(feature = "hub"))]

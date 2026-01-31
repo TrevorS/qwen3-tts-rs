@@ -146,15 +146,18 @@ pub fn save_wav<P: AsRef<Path>>(path: P, samples: &[f32], sample_rate: u32) -> R
     let spec = WavSpec {
         channels: 1,
         sample_rate,
-        bits_per_sample: 32,
-        sample_format: SampleFormat::Float,
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
     };
 
     let mut writer = WavWriter::create(path, spec)
         .with_context(|| format!("Failed to create WAV file: {}", path.display()))?;
 
     for &sample in samples {
-        writer.write_sample(sample)?;
+        // Clamp to [-1.0, 1.0] and convert to i16
+        let clamped = sample.clamp(-1.0, 1.0);
+        let scaled = (clamped * 32767.0) as i16;
+        writer.write_sample(scaled)?;
     }
 
     writer.finalize()?;
@@ -274,7 +277,7 @@ mod tests {
         assert_eq!(loaded.samples.len(), 5);
 
         for (a, b) in original.samples.iter().zip(loaded.samples.iter()) {
-            assert!((a - b).abs() < 1e-5);
+            assert!((a - b).abs() < 1e-4, "sample mismatch: {a} vs {b}");
         }
     }
 

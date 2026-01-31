@@ -165,13 +165,13 @@ def main():
 
     # WER check
     if expected_text:
-        print(f"\n  Expected text: \"{expected_text}\"")
+        print(f'\n  Expected text: "{expected_text}"')
         transcript = transcribe_with_whisper(wav_path)
         if transcript is not None:
             wer = compute_wer(expected_text, transcript)
             report["transcript"] = transcript
             report["wer"] = round(wer, 4)
-            print(f"  Transcript:    \"{transcript}\"")
+            print(f'  Transcript:    "{transcript}"')
             print(f"  WER:           {wer:.2%}")
             if wer > 0.3:
                 report["issues"].append(f"WARN: high WER ({wer:.2%})")

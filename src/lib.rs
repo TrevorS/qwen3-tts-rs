@@ -799,11 +799,20 @@ impl Qwen3TTS {
             let ref_len = ref_frames.len();
             let mut combined = ref_frames;
             combined.extend(all_codes.iter().cloned());
-            let total_len = combined.len();
 
             let mut audio = self.decode_codes(&combined)?;
-            let cut_samples = ref_len * audio.len() / total_len;
-            audio.samples = audio.samples[cut_samples..].to_vec();
+            let total_frames = combined.len();
+            // Proportional cut: matches official Qwen3-TTS Python implementation
+            // cut = ref_len / total_len * wav.shape[0]
+            let cut_samples = ref_len * audio.len() / total_frames.max(1);
+            tracing::debug!(
+                "ICL decode: ref_frames={}, gen_frames={}, total_samples={}, cut_samples={}",
+                ref_len,
+                all_codes.len(),
+                audio.len(),
+                cut_samples,
+            );
+            audio.samples = audio.samples[cut_samples.min(audio.len())..].to_vec();
             audio
         } else {
             self.decode_codes(&all_codes)?
@@ -877,6 +886,19 @@ impl Qwen3TTS {
             };
             anyhow::anyhow!("Speaker encoder not available.{}", hint)
         })?;
+
+        // Resample to 24kHz if needed — both encoders assume 24kHz input
+        let ref_audio_24k;
+        let ref_audio = if ref_audio.sample_rate != 24000 {
+            tracing::info!(
+                "Resampling reference audio from {}Hz to 24000Hz",
+                ref_audio.sample_rate
+            );
+            ref_audio_24k = audio::resample_to_24k(ref_audio)?;
+            &ref_audio_24k
+        } else {
+            ref_audio
+        };
 
         let speaker_embedding = encoder.encode(ref_audio)?; // [enc_dim]
 

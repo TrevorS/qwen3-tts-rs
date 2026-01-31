@@ -11,8 +11,8 @@ tools/.venv/
 # Generated audio files
 *.wav
 
-# Reference audio for voice cloning example (public domain, NASA)
-!/examples/data/apollo11_one_small_step.wav
+# Reference audio for voice cloning example (Qwen3-TTS official test audio)
+!/examples/data/clone_2.wav
 
 # README sample assets
 !/assets/audio/*.wav

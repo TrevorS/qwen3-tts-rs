@@ -1,6 +1,6 @@
 # Dockerfile for qwen3-tts
 #
-# Uses the NGC PyTorch container which includes CUDA 13.1 toolkit,
+# Uses the NGC PyTorch container which includes CUDA 13.0 toolkit,
 # cuDNN, and NCCL — matching the validated build environment.
 #
 # Build:
@@ -30,7 +30,7 @@
 # CPU-only build (smaller, no CUDA):
 #   docker build --build-arg FEATURES=cli --build-arg BASE=ubuntu:22.04 -t qwen3-tts-cpu .
 
-ARG BASE=nvcr.io/nvidia/pytorch:25.12-py3
+ARG BASE=nvcr.io/nvidia/pytorch:25.11-py3
 
 FROM ${BASE}
 
@@ -61,9 +61,15 @@ RUN cargo build --release --features "${FEATURES}"
 RUN cp target/release/generate_audio /usr/local/bin/ \
     && rm -rf target/
 
-# Copy example audio to a known location
+# Install uv + Whisper for audio intelligibility testing
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+RUN uv pip install --system --no-cache openai-whisper scipy flash-attn
+
+# Copy example audio and whisper transcribe script
 RUN mkdir -p /examples/data \
-    && cp examples/data/apollo11_one_small_step.wav /examples/data/
+    && cp examples/data/clone_2.wav /examples/data/
+COPY scripts/transcribe.py /usr/local/bin/transcribe.py
 
 RUN mkdir -p /output
 WORKDIR /output
