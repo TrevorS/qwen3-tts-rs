@@ -6,6 +6,15 @@ All code in this repo was written with [Claude Code](https://claude.ai/code). Th
 
 ## Changelog
 
+### 0.4.0
+
+- Pre-allocated KV cache with InplaceOp2 (zero-copy CUDA writes, no Tensor::cat)
+- GPU-side repetition penalty mask (incremental slice_assign, eliminates growing CPU transfer)
+- Deferred acoustic codes transfer (single bulk GPU→CPU at end of generation)
+- Fused residual + RMSNorm CUDA kernel
+- GPU→CPU syncs reduced from 3/frame to 1/frame (4-byte EOS check)
+- Non-streaming RTF: 0.48–0.67 across all variants (97-100% of theoretical throughput)
+
 ### 0.3.0
 
 - GPU-side sampling: batched argmax, on-device top-k/top-p/repetition penalty
@@ -52,16 +61,16 @@ Thanks to [u/rngesius](https://www.reddit.com/r/LocalLLaMA/comments/1qqvb79/comm
 Benchmarked on an NVIDIA DGX Spark (GB10 Blackwell, ARM Cortex-X925, 120 GB unified memory).
 Default generation parameters, seed 42, 2 warmup + 3 timed iterations.
 
-| Model | RTF (short) | RTF (long) | Tok/s | TTFA | Memory |
-|-------|-------------|------------|-------|------|--------|
-| **0.6B Base (CUDA BF16)** | **0.56** | **0.68** | 22.2 | 448 ms | 814 MB |
-| **1.7B Base (CUDA BF16)** | **0.72** | **0.74** | 17.3 | 590 ms | 761 MB |
-| **1.7B CustomVoice (CUDA BF16)** | **0.72** | **0.75** | 17.3 | 585 ms | 761 MB |
-| **1.7B VoiceDesign (CUDA BF16)** | **0.72** | **0.75** | 17.3 | 585 ms | 761 MB |
-| 1.7B CustomVoice (CPU F32) | 5.39 | 6.48 | 2.1 | — | 9.1 GB |
+| Model | RTF (short) | RTF (long) | Tok/s | Memory |
+|-------|-------------|------------|-------|--------|
+| **0.6B Base (CUDA BF16)** | **0.48** | **0.50** | 25.9 | 767 MB |
+| **1.7B Base (CUDA BF16)** | **0.65** | **0.65** | 19.4 | 767 MB |
+| **1.7B CustomVoice (CUDA BF16)** | **0.64** | **0.67** | 19.2 | 772 MB |
+| **1.7B VoiceDesign (CUDA BF16)** | **0.64** | **0.66** | 19.3 | 770 MB |
+| 1.7B CustomVoice (CPU F32) | 5.39 | 6.48 | 2.1 | 9.1 GB |
 
 RTF (real-time factor) = wall-clock / audio duration. **< 1.0 is faster than real-time.**
-TTFA = time to first audio chunk via streaming.
+Non-streaming results shown above. Streaming adds ~8-12% overhead with TTFA ~444 ms (0.6B) / ~580 ms (1.7B).
 
 See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for full results, test corpus, micro-benchmarks, and reproduction instructions.
 

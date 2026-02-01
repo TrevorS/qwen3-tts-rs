@@ -1,4 +1,4 @@
-.PHONY: lint fmt pre-commit pre-commit-install profile-chrome profile-flamegraph profile-nsys audit-gpu-syncs
+.PHONY: lint fmt pre-commit pre-commit-install profile-chrome profile-flamegraph profile-nsys audit-gpu-syncs test-kernel count-kernels
 
 MODEL_DIR ?= test_data
 
@@ -33,3 +33,11 @@ profile-nsys:
 
 audit-gpu-syncs:
 	@bash scripts/audit-gpu-syncs.sh
+
+# ── Kernel Development ──────────────────────────────────────────────────
+
+test-kernel:
+	@bash scripts/test-kernel.sh $(NAME)
+
+count-kernels:
+	@bash scripts/count-kernels.sh $(MODEL_DIR)

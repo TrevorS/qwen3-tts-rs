@@ -366,6 +366,39 @@ pub fn apply_repetition_penalty(
     Ok((logits * final_factor)?)
 }
 
+/// Apply repetition penalty using a pre-built boolean mask on GPU.
+///
+/// Instead of transferring all generated token IDs to CPU each frame,
+/// callers maintain a `[1, vocab]` mask on GPU that marks which tokens
+/// have been seen. This eliminates the O(n) GPU→CPU transfer that
+/// otherwise grows with each frame.
+pub fn apply_repetition_penalty_with_mask(
+    logits: &Tensor,
+    penalty_mask: &Tensor,
+    penalty: f64,
+) -> Result<Tensor> {
+    if (penalty - 1.0).abs() < 1e-9 {
+        return Ok(logits.clone());
+    }
+
+    let penalty_f32 = penalty as f32;
+
+    let penalty_mask = penalty_mask.broadcast_as(logits.shape())?;
+
+    let is_positive = logits.gt(&Tensor::zeros(logits.shape(), DType::F32, logits.device())?)?;
+    let pos_factor =
+        Tensor::new(&[1.0 / penalty_f32], logits.device())?.broadcast_as(logits.shape())?;
+    let neg_factor = Tensor::new(&[penalty_f32], logits.device())?.broadcast_as(logits.shape())?;
+    let penalty_factor = is_positive.where_cond(&pos_factor, &neg_factor)?;
+
+    let ones = Tensor::ones(logits.shape(), DType::F32, logits.device())?;
+    let is_penalized =
+        penalty_mask.gt(&Tensor::zeros(logits.shape(), DType::F32, logits.device())?)?;
+    let final_factor = is_penalized.where_cond(&penalty_factor, &ones)?;
+
+    Ok((logits * final_factor)?)
+}
+
 /// Greedy sampling (argmax)
 pub fn greedy_sample(logits: &Tensor) -> Result<Tensor> {
     Ok(logits.argmax(D::Minus1)?)

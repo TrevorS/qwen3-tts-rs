@@ -11,7 +11,8 @@ mod sampling;
 pub mod tts;
 
 pub use sampling::{
-    apply_repetition_penalty, greedy_sample, sample, GenerationConfig, SamplingContext,
+    apply_repetition_penalty, apply_repetition_penalty_with_mask, greedy_sample, sample,
+    GenerationConfig, SamplingContext,
 };
 
 pub use tts::{

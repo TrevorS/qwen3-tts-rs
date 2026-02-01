@@ -13,7 +13,9 @@ use candle_core::{IndexOp, Module, Tensor, D};
 use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
 
 use super::config::Qwen3TTSConfig;
-use super::transformer::{DecoderLayer, KVCache, RoPEType, RotaryEmbedding};
+use super::kv_cache::{AnyKVCache, KVCache, PreAllocKVCache};
+use super::transformer::{DecoderLayer, RoPEType, RotaryEmbedding};
+use candle_core::DType;
 
 /// Code predictor configuration
 #[derive(Debug, Clone)]
@@ -143,6 +145,12 @@ pub struct CodePredictor {
     rope: RoPEType,
     /// Configuration
     config: CodePredictorConfig,
+    /// Cached causal mask for prefill (always 2×2, created once)
+    prefill_mask: Tensor,
+    /// Device (needed for PreAllocKVCache creation)
+    device: candle_core::Device,
+    /// Compute dtype (needed for PreAllocKVCache creation)
+    dtype: DType,
 }
 
 impl CodePredictor {
@@ -204,6 +212,13 @@ impl CodePredictor {
             vb.device(),
         )?);
 
+        // Pre-build the 2×2 causal mask for prefill (talker_hidden + semantic_embed).
+        // This never changes, so building it once avoids per-frame allocation.
+        let prefill_mask = super::transformer::create_causal_mask(2, 0, vb.device())?;
+
+        let device = vb.device().clone();
+        let dtype = vb.dtype();
+
         Ok(Self {
             codec_embeddings,
             small_to_mtp_projection,
@@ -212,6 +227,9 @@ impl CodePredictor {
             lm_heads,
             rope,
             config,
+            prefill_mask,
+            device,
+            dtype,
         })
     }
 
@@ -237,7 +255,7 @@ impl CodePredictor {
         &self,
         hidden: &Tensor,
         _prev_codes: &[u32],
-        kv_caches: &mut [KVCache],
+        kv_caches: &mut [AnyKVCache],
     ) -> Result<Tensor> {
         let device = hidden.device();
         let input = if let Some(proj) = &self.small_to_mtp_projection {
@@ -256,6 +274,35 @@ impl CodePredictor {
         Ok(self.norm.forward(&h)?)
     }
 
+    /// Create a set of KV caches for the code predictor (one per layer).
+    ///
+    /// Callers should create this once and pass it to [`CodePredictor::generate_acoustic_codes`]
+    /// on each frame — the method resets the caches internally, avoiding
+    /// per-frame allocation.
+    pub fn new_kv_caches(&self) -> Vec<AnyKVCache> {
+        // Code predictor: 2 prefill + 15 decode = 17 max tokens
+        const CP_MAX_SEQ: usize = 17;
+
+        (0..self.config.num_hidden_layers)
+            .map(|_| {
+                if self.device.is_cuda() {
+                    PreAllocKVCache::new(
+                        1, // batch
+                        self.config.num_key_value_heads,
+                        CP_MAX_SEQ,
+                        self.config.head_dim,
+                        self.dtype,
+                        &self.device,
+                    )
+                    .map(AnyKVCache::PreAlloc)
+                    .unwrap_or_else(|_| AnyKVCache::Concat(KVCache::new()))
+                } else {
+                    AnyKVCache::Concat(KVCache::new())
+                }
+            })
+            .collect()
+    }
+
     /// Generate all 15 acoustic tokens autoregressively.
     ///
     /// Each acoustic code is predicted conditioned on the talker hidden state,
@@ -265,17 +312,24 @@ impl CodePredictor {
     /// # Arguments
     /// * `talker_hidden` - Hidden state from talker model, shape `[batch, 1, hidden]`
     /// * `semantic_embed` - Embedding of semantic token, shape `[batch, 1, hidden]`
+    /// * `cp_kv_caches` - Reusable KV caches (created via [`CodePredictor::new_kv_caches`]). Reset internally each call.
     ///
     /// # Returns
-    /// Tuple of (acoustic codes as `Vec<u32>`, codes as GPU tensor \[num_acoustic\]).
-    /// The tensor is returned to allow GPU-side embedding lookup without re-uploading.
+    /// GPU tensor of shape `[num_acoustic]` containing the 15 acoustic code IDs.
+    /// Stays on device to avoid GPU→CPU sync; callers should use tensor ops directly.
     pub fn generate_acoustic_codes(
         &self,
         talker_hidden: &Tensor,
         semantic_embed: &Tensor,
-    ) -> Result<(Vec<u32>, Tensor)> {
+        cp_kv_caches: &mut [AnyKVCache],
+    ) -> Result<Tensor> {
         #[cfg(feature = "profiling")]
         let _span = tracing::info_span!("code_predictor_inner").entered();
+
+        // Reset caches from previous frame
+        for cache in cp_kv_caches.iter_mut() {
+            cache.reset();
+        }
 
         let device = talker_hidden.device();
         let num_acoustic = self.config.num_code_groups - 1; // 15 acoustic codes
@@ -291,16 +345,24 @@ impl CodePredictor {
         };
 
         let seq_len = input.dim(1)?;
-        let mask = self.create_causal_mask(seq_len, device)?;
-
-        // Run prefill through all 5 transformer layers with KV cache
-        let mut kv_caches: Vec<KVCache> = (0..self.config.num_hidden_layers)
-            .map(|_| KVCache::new())
-            .collect();
+        // Use cached mask for the standard 2-token prefill, create on-the-fly otherwise
+        let dynamic_mask;
+        let mask = if seq_len == 2 {
+            &self.prefill_mask
+        } else {
+            dynamic_mask = self.create_causal_mask(seq_len, device)?;
+            &dynamic_mask
+        };
 
         let mut hidden = input;
         for (i, layer) in self.layers.iter().enumerate() {
-            hidden = layer.forward(&hidden, &self.rope, Some(&mask), Some(&mut kv_caches[i]), 0)?;
+            hidden = layer.forward(
+                &hidden,
+                &self.rope,
+                Some(mask),
+                Some(&mut cp_kv_caches[i]),
+                0,
+            )?;
         }
         hidden = self.norm.forward(&hidden)?;
 
@@ -337,7 +399,7 @@ impl CodePredictor {
             // no masking needed (all-zeros mask is a no-op).
             let mut h = code_embed;
             for (i, layer) in self.layers.iter().enumerate() {
-                h = layer.forward(&h, &self.rope, None, Some(&mut kv_caches[i]), offset)?;
+                h = layer.forward(&h, &self.rope, None, Some(&mut cp_kv_caches[i]), offset)?;
             }
             h = self.norm.forward(&h)?;
 
@@ -350,11 +412,7 @@ impl CodePredictor {
             offset += 1;
         }
 
-        // Single GPU→CPU transfer for all codes
-        tracing::trace!(target: "gpu_sync", "to_vec1 in code_predictor all acoustic codes (batched)");
-        let codes: Vec<u32> = all_codes.to_vec1()?;
-
-        Ok((codes, all_codes))
+        Ok(all_codes)
     }
 
     fn create_causal_mask(&self, seq_len: usize, device: &candle_core::Device) -> Result<Tensor> {

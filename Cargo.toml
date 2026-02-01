@@ -67,6 +67,7 @@ audioadapter-buffers = "2.0.0"
 
 # Profiling (optional)
 tracing-chrome = { version = "0.7", optional = true }
+half = "2.7.1"
 
 [dev-dependencies]
 criterion = "0.8"

@@ -555,7 +555,7 @@ fn main() -> Result<()> {
     };
 
     // Initialize KV caches
-    let mut kv_caches = talker.new_kv_caches();
+    let mut kv_caches = talker.new_kv_caches(gen_config.max_new_tokens + 256);
 
     // Prefill with CustomVoice format:
     //   [role_prefix (im_start, assistant, newline)]
@@ -593,6 +593,7 @@ fn main() -> Result<()> {
 
     // Collect all codes
     let mut all_codes: Vec<Vec<u32>> = Vec::new();
+    let mut cp_kv_caches = code_predictor.new_kv_caches();
 
     // Generation loop: for each frame, generate acoustic codes, then prepare next step
     for frame_idx in 0..num_frames {
@@ -611,8 +612,11 @@ fn main() -> Result<()> {
         let semantic_embed = talker.get_codec_embedding(semantic_token)?;
 
         // Generate 15 acoustic codes using code predictor
-        let (acoustic_codes, _) =
-            code_predictor.generate_acoustic_codes(&last_hidden, &semantic_embed)?;
+        let (acoustic_codes, _) = code_predictor.generate_acoustic_codes(
+            &last_hidden,
+            &semantic_embed,
+            &mut cp_kv_caches,
+        )?;
 
         if frame_idx < 5 || frame_idx == num_frames - 1 {
             println!(

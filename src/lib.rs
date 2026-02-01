@@ -99,7 +99,7 @@ use std::time::Instant;
 
 use models::codec::{Decoder12Hz, Encoder12Hz};
 use models::speaker::SpeakerEncoder;
-use models::KVCache;
+use models::AnyKVCache;
 
 // SynthesisTiming is defined above, already public.
 
@@ -447,7 +447,7 @@ impl Qwen3TTS {
         sync_device(&self.device)?;
         let t_prefill = Instant::now();
 
-        let mut kv_caches = self.talker.new_kv_caches();
+        let mut kv_caches = self.talker.new_kv_caches(gen_config.max_new_tokens + 256);
         let (hidden, logits) =
             self.talker
                 .prefill_custom_voice(&input_ids, speaker, language, &mut kv_caches)?;
@@ -531,7 +531,7 @@ impl Qwen3TTS {
         &self,
         gen_config: &generation::GenerationConfig,
         sampling_ctx: &mut generation::SamplingContext,
-        kv_caches: &mut [KVCache],
+        kv_caches: &mut [AnyKVCache],
         mut offset: usize,
         mut last_hidden: Tensor,
         initial_logits: &Tensor,
@@ -539,8 +539,6 @@ impl Qwen3TTS {
         trailing_text_len: usize,
         tts_pad_embed: &Tensor,
     ) -> Result<FrameCodes> {
-        let mut generated_tokens: Vec<u32> = Vec::new();
-
         // Pre-build the token suppression mask once (reused every frame)
         let suppression_mask = generation::build_suppression_mask(
             codec_tokens::CODEC_VOCAB_SIZE,
@@ -548,21 +546,33 @@ impl Qwen3TTS {
             &self.device,
         )?;
 
+        // GPU-side repetition penalty mask: [1, vocab] — updated incrementally
+        // instead of transferring all generated tokens to CPU each frame.
+        let vocab_size = codec_tokens::CODEC_VOCAB_SIZE;
+        let mut penalty_mask = Tensor::zeros((1, vocab_size), DType::F32, &self.device)?;
+
+        // Pre-allocate code predictor KV caches (reused + reset each frame)
+        let mut cp_kv_caches = self.code_predictor.new_kv_caches();
+
         // Sample first semantic token
         let logits_2d = initial_logits.squeeze(1)?;
-        let logits_2d = self.apply_generation_penalties(
+        let logits_2d = self.apply_generation_penalties_gpu(
             &logits_2d,
-            &generated_tokens,
+            &penalty_mask,
             gen_config,
             0,
             Some(&suppression_mask),
         )?;
-        let first_token = generation::sample(&logits_2d, gen_config, sampling_ctx)?;
+        let mut semantic_token_tensor = generation::sample(&logits_2d, gen_config, sampling_ctx)?;
         tracing::trace!(target: "gpu_sync", "to_vec1 in generate_codes first token");
-        let mut semantic_token: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
-        generated_tokens.push(semantic_token);
+        let mut semantic_token: u32 = semantic_token_tensor.flatten_all()?.to_vec1::<u32>()?[0];
+        // Update penalty mask with this token (O(1) CPU work)
+        Self::update_penalty_mask(&mut penalty_mask, semantic_token, vocab_size)?;
+        let mut token_count: usize = 1;
 
-        let mut all_codes: FrameCodes = Vec::new();
+        // Accumulate frames as GPU tensors: Vec of [16] U32 tensors
+        // Deferred to_vec1 at the end eliminates per-frame acoustic code sync.
+        let mut gpu_frames: Vec<Tensor> = Vec::new();
 
         #[cfg(feature = "profiling")]
         let _gen_span = tracing::info_span!("generate_frames").entered();
@@ -574,21 +584,29 @@ impl Qwen3TTS {
                 }
             }
 
-            let semantic_embed = self.talker.get_codec_embedding(semantic_token)?;
+            // Embedding lookup using GPU-resident token tensor (no CPU→GPU roundtrip)
+            let semantic_embed = self
+                .talker
+                .get_codec_embedding_from_tensor(&semantic_token_tensor)?;
 
             #[cfg(feature = "profiling")]
             let _cp_span = tracing::info_span!("code_predictor", frame = frame_idx).entered();
 
-            let (acoustic_codes, acoustic_codes_tensor) = self
-                .code_predictor
-                .generate_acoustic_codes(&last_hidden, &semantic_embed)?;
+            let acoustic_codes_tensor = self.code_predictor.generate_acoustic_codes(
+                &last_hidden,
+                &semantic_embed,
+                &mut cp_kv_caches,
+            )?;
 
             #[cfg(feature = "profiling")]
             drop(_cp_span);
 
-            let mut frame_codes = vec![semantic_token];
-            frame_codes.extend(&acoustic_codes);
-            all_codes.push(frame_codes);
+            // Build [16] frame tensor on GPU: [semantic_token, acoustic_0..14]
+            let frame_tensor = Tensor::cat(
+                &[&semantic_token_tensor.reshape(1)?, &acoustic_codes_tensor],
+                0,
+            )?;
+            gpu_frames.push(frame_tensor);
 
             // Use GPU tensor directly for embedding lookup (avoids 15 CPU→GPU transfers)
             let acoustic_embed_sum = self
@@ -619,20 +637,56 @@ impl Qwen3TTS {
             let _sample_span = tracing::info_span!("sampling", frame = frame_idx).entered();
 
             let logits_2d = new_logits.squeeze(1)?;
-            let logits_2d = self.apply_generation_penalties(
+            let logits_2d = self.apply_generation_penalties_gpu(
                 &logits_2d,
-                &generated_tokens,
+                &penalty_mask,
                 gen_config,
-                generated_tokens.len(),
+                token_count,
                 Some(&suppression_mask),
             )?;
-            let next_token = generation::sample(&logits_2d, gen_config, sampling_ctx)?;
+            semantic_token_tensor = generation::sample(&logits_2d, gen_config, sampling_ctx)?;
             tracing::trace!(target: "gpu_sync", "to_vec1 in generate_codes sampling");
-            semantic_token = next_token.flatten_all()?.to_vec1::<u32>()?[0];
-            generated_tokens.push(semantic_token);
+            semantic_token = semantic_token_tensor.flatten_all()?.to_vec1::<u32>()?[0];
+            Self::update_penalty_mask(&mut penalty_mask, semantic_token, vocab_size)?;
+            token_count += 1;
         }
 
-        Ok(all_codes)
+        // Single GPU→CPU transfer: convert all accumulated GPU frames to FrameCodes
+        self.gpu_frames_to_frame_codes(&gpu_frames)
+    }
+
+    /// Update the GPU-side penalty mask for a single token ID.
+    ///
+    /// Sets `penalty_mask[0, token_id] = 1.0` using slice_assign with a
+    /// pre-built scalar. This is O(1) CPU work (no GPU→CPU transfer).
+    fn update_penalty_mask(
+        penalty_mask: &mut Tensor,
+        token_id: u32,
+        vocab_size: usize,
+    ) -> Result<()> {
+        let idx = token_id as usize;
+        if idx < vocab_size {
+            let one = Tensor::ones((1, 1), DType::F32, penalty_mask.device())?;
+            *penalty_mask = penalty_mask.slice_assign(&[0..1, idx..idx + 1], &one)?;
+        }
+        Ok(())
+    }
+
+    /// Convert accumulated GPU frame tensors to FrameCodes via a single bulk transfer.
+    fn gpu_frames_to_frame_codes(&self, gpu_frames: &[Tensor]) -> Result<FrameCodes> {
+        if gpu_frames.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Stack all frames into [n_frames, 16], then single to_vec1
+        let stacked = Tensor::stack(gpu_frames, 0)?; // [n_frames, 16]
+        let n_frames = stacked.dim(0)?;
+        let flat: Vec<u32> = stacked.flatten_all()?.to_vec1()?;
+        let mut result = Vec::with_capacity(n_frames);
+        for f in 0..n_frames {
+            let start = f * 16;
+            result.push(flat[start..start + 16].to_vec());
+        }
+        Ok(result)
     }
 
     /// Synthesize speech with a specific voice and language.
@@ -699,7 +753,7 @@ impl Qwen3TTS {
         #[cfg(feature = "profiling")]
         let _prefill_span = tracing::info_span!("prefill").entered();
 
-        let mut kv_caches = self.talker.new_kv_caches();
+        let mut kv_caches = self.talker.new_kv_caches(gen_config.max_new_tokens + 256);
         let (hidden, logits) =
             self.talker
                 .prefill_custom_voice(&input_ids, speaker, language, &mut kv_caches)?;
@@ -782,7 +836,7 @@ impl Qwen3TTS {
         #[cfg(feature = "profiling")]
         let _prefill_span = tracing::info_span!("prefill").entered();
 
-        let mut kv_caches = self.talker.new_kv_caches();
+        let mut kv_caches = self.talker.new_kv_caches(gen_config.max_new_tokens + 256);
         let (hidden, logits) = self.talker.prefill_voice_design(
             &input_ids,
             &instruct_ids,
@@ -881,7 +935,7 @@ impl Qwen3TTS {
         #[cfg(feature = "profiling")]
         let _prefill_span = tracing::info_span!("prefill").entered();
 
-        let mut kv_caches = self.talker.new_kv_caches();
+        let mut kv_caches = self.talker.new_kv_caches(gen_config.max_new_tokens + 256);
         let (hidden, logits) = self.talker.prefill_voice_clone(
             &input_ids,
             &speaker_embed,
@@ -1168,32 +1222,34 @@ impl Qwen3TTS {
         Ok(hidden)
     }
 
-    /// Apply repetition penalty, token suppression, and min_new_tokens EOS suppression.
+    /// Apply repetition penalty, token suppression, and min_new_tokens EOS suppression
+    /// using a pre-built `[1, vocab]` penalty mask on GPU.
     ///
-    /// This is the standard logit processing pipeline matching Python/HuggingFace order:
-    /// 1. Repetition penalty (penalize previously generated tokens)
-    /// 2. Token suppression (mask reserved control tokens except EOS)
-    /// 3. Min new tokens (suppress EOS if fewer than min_new_tokens have been generated)
-    fn apply_generation_penalties(
+    /// The mask is updated incrementally via [`update_penalty_mask`] after each
+    /// sampled token, eliminating the O(n) GPU→CPU transfer that grows with
+    /// each frame.
+    fn apply_generation_penalties_gpu(
         &self,
         logits: &Tensor,
-        generated_tokens: &[u32],
+        penalty_mask: &Tensor,
         config: &generation::GenerationConfig,
         token_count: usize,
         suppression_mask: Option<&generation::SuppressionMask>,
     ) -> Result<Tensor> {
-        // Cast to F32 for penalty math (model may produce BF16 logits)
         let logits = logits.to_dtype(DType::F32)?;
 
-        // 1. Repetition penalty
-        let logits = if config.repetition_penalty != 1.0 && !generated_tokens.is_empty() {
-            let prev = Tensor::new(generated_tokens, &self.device)?;
-            generation::apply_repetition_penalty(&logits, &prev, config.repetition_penalty)?
+        // 1. Repetition penalty via pre-built GPU mask
+        let logits = if config.repetition_penalty != 1.0 {
+            generation::apply_repetition_penalty_with_mask(
+                &logits,
+                penalty_mask,
+                config.repetition_penalty,
+            )?
         } else {
             logits
         };
 
-        // 2. Token suppression (use pre-built mask if available)
+        // 2. Token suppression
         let logits = if let Some(mask) = suppression_mask {
             generation::apply_token_suppression_with_mask(&logits, mask)?
         } else {
@@ -1204,8 +1260,7 @@ impl Qwen3TTS {
             )?
         };
 
-        // 3. Min new tokens: suppress EOS if we haven't generated enough tokens yet
-        //    Uses on-device masking to avoid pulling full logits to CPU.
+        // 3. Min new tokens EOS suppression
         if token_count < config.min_new_tokens {
             if let Some(eos_id) = config.eos_token_id {
                 let vocab = logits.dim(1)?;
@@ -1390,10 +1445,11 @@ pub struct StreamingSession<'a> {
     model: &'a Qwen3TTS,
     config: generation::GenerationConfig,
     sampling_ctx: generation::SamplingContext,
-    kv_caches: Vec<KVCache>,
+    kv_caches: Vec<AnyKVCache>,
     offset: usize,
     last_hidden: Tensor,
     current_token: Option<u32>,
+    current_token_tensor: Option<Tensor>,
     frames_generated: usize,
     frame_buffer: FrameCodes,
     chunk_frames: usize,
@@ -1402,10 +1458,13 @@ pub struct StreamingSession<'a> {
     trailing_text_hidden: Tensor,
     trailing_text_len: usize,
     tts_pad_embed: Tensor,
-    // Track generated semantic tokens for repetition penalty
-    generated_tokens: Vec<u32>,
+    // GPU-side repetition penalty mask [1, vocab] — updated incrementally
+    penalty_mask: Tensor,
+    token_count: usize,
     // Pre-built suppression mask (reused every frame)
     suppression_mask: generation::SuppressionMask,
+    // Pre-allocated code predictor KV caches (reused + reset each frame)
+    cp_kv_caches: Vec<AnyKVCache>,
 }
 
 impl<'a> StreamingSession<'a> {
@@ -1423,7 +1482,7 @@ impl<'a> StreamingSession<'a> {
             model.build_trailing_text(input_ids)?;
 
         // Prefill with CustomVoice format
-        let mut kv_caches = model.talker.new_kv_caches();
+        let mut kv_caches = model.talker.new_kv_caches(config.max_new_tokens + 256);
         let (hidden, logits) =
             model
                 .talker
@@ -1439,20 +1498,22 @@ impl<'a> StreamingSession<'a> {
         )?;
 
         // Sample first token with full penalty pipeline
-        let mut generated_tokens: Vec<u32> = Vec::new();
+        let vocab_size = codec_tokens::CODEC_VOCAB_SIZE;
+        let mut penalty_mask = Tensor::zeros((1, vocab_size), DType::F32, &model.device)?;
         let logits_2d = logits.squeeze(1)?;
-        let logits_2d = model.apply_generation_penalties(
+        let logits_2d = model.apply_generation_penalties_gpu(
             &logits_2d,
-            &generated_tokens,
+            &penalty_mask,
             &config,
             0,
             Some(&suppression_mask),
         )?;
         let first_token = generation::sample(&logits_2d, &config, &mut sampling_ctx)?;
         let first_token_id: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
-        generated_tokens.push(first_token_id);
+        Qwen3TTS::update_penalty_mask(&mut penalty_mask, first_token_id, vocab_size)?;
 
         let done = config.eos_token_id == Some(first_token_id);
+        let cp_kv_caches = model.code_predictor.new_kv_caches();
 
         Ok(Self {
             model,
@@ -1462,6 +1523,7 @@ impl<'a> StreamingSession<'a> {
             offset: prefill_len,
             last_hidden,
             current_token: if done { None } else { Some(first_token_id) },
+            current_token_tensor: if done { None } else { Some(first_token) },
             frames_generated: 0,
             frame_buffer: Vec::new(),
             chunk_frames: options.chunk_frames,
@@ -1469,8 +1531,10 @@ impl<'a> StreamingSession<'a> {
             trailing_text_hidden,
             trailing_text_len,
             tts_pad_embed,
-            generated_tokens,
+            penalty_mask,
+            token_count: 1,
             suppression_mask,
+            cp_kv_caches,
         })
     }
 
@@ -1493,24 +1557,32 @@ impl<'a> StreamingSession<'a> {
         while self.frame_buffer.len() < self.chunk_frames
             && self.frames_generated < self.config.max_new_tokens
         {
-            let token_id = match self.current_token {
-                Some(id) => id,
-                None => {
-                    self.done = true;
-                    break;
-                }
-            };
+            let (token_id, token_tensor) =
+                match (self.current_token, self.current_token_tensor.take()) {
+                    (Some(id), Some(t)) => (id, t),
+                    _ => {
+                        self.done = true;
+                        break;
+                    }
+                };
 
-            let semantic_embed = self.model.talker.get_codec_embedding(token_id)?;
-
-            // Generate 15 acoustic codes
-            let (acoustic_codes, acoustic_codes_tensor) = self
+            // Embedding lookup using GPU-resident token tensor (no CPU→GPU roundtrip)
+            let semantic_embed = self
                 .model
-                .code_predictor
-                .generate_acoustic_codes(&self.last_hidden, &semantic_embed)?;
+                .talker
+                .get_codec_embedding_from_tensor(&token_tensor)?;
 
-            let mut frame_codes = vec![token_id];
-            frame_codes.extend(&acoustic_codes);
+            // Generate 15 acoustic codes (stays on GPU)
+            let acoustic_codes_tensor = self.model.code_predictor.generate_acoustic_codes(
+                &self.last_hidden,
+                &semantic_embed,
+                &mut self.cp_kv_caches,
+            )?;
+
+            // Build frame on GPU, then transfer for frame_buffer
+            let semantic_t = Tensor::new(&[token_id], self.model.device())?;
+            let frame_tensor = Tensor::cat(&[&semantic_t, &acoustic_codes_tensor], 0)?;
+            let frame_codes: Vec<u32> = frame_tensor.to_vec1()?;
             self.frame_buffer.push(frame_codes);
 
             let frame_idx = self.frames_generated;
@@ -1542,22 +1614,30 @@ impl<'a> StreamingSession<'a> {
 
             // Sample next semantic token with repetition penalty + token suppression + min_new_tokens
             let logits_2d = new_logits.squeeze(1)?;
-            let logits_2d = self.model.apply_generation_penalties(
+            let logits_2d = self.model.apply_generation_penalties_gpu(
                 &logits_2d,
-                &self.generated_tokens,
+                &self.penalty_mask,
                 &self.config,
-                self.generated_tokens.len(),
+                self.token_count,
                 Some(&self.suppression_mask),
             )?;
-            let next_token = generation::sample(&logits_2d, &self.config, &mut self.sampling_ctx)?;
-            let next_token_id: u32 = next_token.flatten_all()?.to_vec1::<u32>()?[0];
-            self.generated_tokens.push(next_token_id);
+            let next_token_tensor =
+                generation::sample(&logits_2d, &self.config, &mut self.sampling_ctx)?;
+            let next_token_id: u32 = next_token_tensor.flatten_all()?.to_vec1::<u32>()?[0];
+            Qwen3TTS::update_penalty_mask(
+                &mut self.penalty_mask,
+                next_token_id,
+                codec_tokens::CODEC_VOCAB_SIZE,
+            )?;
+            self.token_count += 1;
 
             if self.config.eos_token_id == Some(next_token_id) {
                 self.current_token = None;
+                self.current_token_tensor = None;
                 self.done = true;
             } else {
                 self.current_token = Some(next_token_id);
+                self.current_token_tensor = Some(next_token_tensor);
             }
         }
 
