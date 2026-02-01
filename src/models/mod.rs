@@ -11,11 +11,13 @@
 pub mod code_predictor;
 pub mod codec;
 pub mod config;
+pub mod kv_cache;
 pub mod speaker;
 pub mod talker;
 pub mod transformer;
 
 pub use code_predictor::{CodePredictor, CodePredictorConfig};
 pub use config::{ModelType, ParsedModelConfig, Qwen3TTSConfig, SpeakerEncoderConfig};
+pub use kv_cache::{AnyKVCache, KVCache, PreAllocKVCache};
 pub use talker::{TalkerConfig, TalkerModel};
-pub use transformer::{KVCache, MRoPE, RoPEType, RotaryEmbedding};
+pub use transformer::{MRoPE, RoPEType, RotaryEmbedding};

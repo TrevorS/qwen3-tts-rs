@@ -11,9 +11,10 @@
 ## Optimizations 1-3: GPU sync elimination (2026-01-31)
 
 All three optimizations applied together:
+
 1. Batch code_predictor argmax (15 fewer GPU→CPU syncs per frame)
-2. GPU-side top-k/top-p filtering (no logit vector CPU transfer)
-3. GPU-side repetition penalty & EOS suppression (on-device masking)
+1. GPU-side top-k/top-p filtering (no logit vector CPU transfer)
+1. GPU-side repetition penalty & EOS suppression (on-device masking)
 
 | Label | Words | Wall (ms) | ±stddev | Audio (s) | RTF | Tok/s | Mem (MB) | Prefill | Generate | Decode |
 |-------|-------|-----------|---------|-----------|-----|-------|----------|---------|----------|--------|
@@ -33,13 +34,36 @@ rebuilding it each frame.
 | medium | 53 | 21935 | 94 | 33.12 | 0.662 | 18.9 | 836 | 20ms (0%) | 20903ms (95%) | 1010ms (5%) |
 | long | 115 | 41320 | 59 | 60.32 | 0.685 | 18.2 | 847 | 20ms (0%) | 39476ms (96%) | 1823ms (4%) |
 
+## Optimization 5: Pre-allocated KV cache + GPU-side token forwarding (2026-01-31)
+
+Two changes:
+
+1. **PreAllocKVCache with InplaceOp2**: Pre-allocate fixed-size KV buffers and
+   write via `copy2d` (CUDA) instead of `Tensor::cat` per step. Eliminates all
+   growing allocations during generation. CodePredictor: 17-slot buffers (5
+   layers). TalkerModel: `max_new_tokens + 256` slots (28 layers).
+2. **GPU-side semantic token forwarding**: Keep sampled token tensor on GPU for
+   codec embedding lookup instead of roundtripping through CPU `u32` →
+   `Tensor::new`.
+
+| Label | Words | Wall (ms) | ±stddev | Audio (s) | RTF | Tok/s | Mem (MB) | Prefill | Generate | Decode |
+|-------|-------|-----------|---------|-----------|-----|-------|----------|---------|----------|--------|
+| short | 13 | 2393 | 3 | 3.68 | 0.650 | 19.2 | 833 | 21ms (1%) | 2236ms (93%) | 135ms (6%) |
+| medium | 53 | 21735 | 15 | 33.12 | 0.656 | 19.0 | 835 | 22ms (0%) | 20709ms (95%) | 1003ms (5%) |
+| long | 115 | 41097 | 31 | 60.32 | 0.681 | 18.3 | 845 | 22ms (0%) | 39252ms (96%) | 1822ms (4%) |
+
+Marginal improvement (~1%) over Optimization 4. Memory dropped ~10 MB despite
+pre-allocating buffers, likely from eliminating intermediate tensors in
+`Tensor::cat`. At 95% of theoretical throughput, allocation overhead was not a
+significant bottleneck.
+
 ## Summary
 
 | Label | Baseline RTF | Final RTF | Speedup | Baseline tok/s | Final tok/s |
 |-------|-------------|-----------|---------|---------------|-------------|
-| short | 1.423 | 0.655 | **2.17x** | 8.8 | 19.1 |
-| medium | 0.700 | 0.662 | **1.06x** | 17.9 | 18.9 |
-| long | 0.718 | 0.685 | **1.05x** | 17.4 | 18.2 |
+| short | 1.423 | 0.650 | **2.19x** | 8.8 | 19.2 |
+| medium | 0.700 | 0.656 | **1.07x** | 17.9 | 19.0 |
+| long | 0.718 | 0.681 | **1.05x** | 17.4 | 18.3 |
 
 ## Analysis: Theoretical Ceiling
 
@@ -77,8 +101,7 @@ At ~52ms/frame, theoretical max is ~19.2 tok/s. We're at 18.2-19.1 tok/s
 
 ### Remaining opportunities (diminishing returns)
 
-- **Pre-allocated KV cache**: Replace `Tensor::cat` per step with pre-allocated
-  buffer + index writes. Saves memory allocation overhead.
+- ~~**Pre-allocated KV cache**~~: Done (Optimization 5). ~1% gain — not a bottleneck.
 - **Quantization (INT8/INT4)**: Reduce memory bandwidth for matmuls.
 - **Custom CUDA kernels**: Fused attention + MLP, fused embedding + projection.
 - **Batched inference**: Process multiple utterances simultaneously.

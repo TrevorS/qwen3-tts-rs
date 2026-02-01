@@ -134,6 +134,7 @@ GPU→CPU sync points are marked with `tracing::trace!(target: "gpu_sync", ...)`
 
 **Implemented.** The `e2e_bench` binary (`benches/e2e_bench.rs`, requires `cli` feature)
 supports:
+
 - Per-stage timing breakdown (prefill / generation / decode)
 - Streaming TTFA measurement (`--streaming`)
 - JSON output (`--json-output results.json`)
@@ -141,6 +142,7 @@ supports:
 - Memory tracking via CUDA APIs
 
 Run all 4 variants sequentially:
+
 ```bash
 for model in 0.6B-Base 1.7B-Base 1.7B-CustomVoice 1.7B-VoiceDesign; do
   cargo run --release --features cuda,cli --bin e2e_bench -- \

@@ -247,7 +247,7 @@ impl Attention {
         hidden_states: &Tensor,
         rope: &RoPEType,
         attention_mask: Option<&Tensor>,
-        kv_cache: Option<&mut KVCache>,
+        kv_cache: Option<&mut AnyKVCache>,
         offset: usize,
     ) -> Result<Tensor> {
         let (batch, seq_len, _) = hidden_states.dims3()?;
@@ -276,9 +276,7 @@ impl Attention {
 
         // Update KV cache
         let (k, v) = if let Some(cache) = kv_cache {
-            let k = cache.update_k(&k)?;
-            let v = cache.update_v(&v)?;
-            (k, v)
+            cache.update(&k, &v)?
         } else {
             (k, v)
         };
@@ -426,7 +424,7 @@ impl DecoderLayer {
         hidden_states: &Tensor,
         rope: &RoPEType,
         attention_mask: Option<&Tensor>,
-        kv_cache: Option<&mut KVCache>,
+        kv_cache: Option<&mut AnyKVCache>,
         offset: usize,
     ) -> Result<Tensor> {
         // Self-attention with residual
@@ -447,81 +445,8 @@ impl DecoderLayer {
     }
 }
 
-/// KV cache for efficient autoregressive generation
-pub struct KVCache {
-    k: Option<Tensor>,
-    v: Option<Tensor>,
-}
-
-impl Default for KVCache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl KVCache {
-    pub fn new() -> Self {
-        Self { k: None, v: None }
-    }
-
-    pub fn update_k(&mut self, k: &Tensor) -> Result<Tensor> {
-        let k = if let Some(prev_k) = &self.k {
-            Tensor::cat(&[prev_k, k], 2)?
-        } else {
-            k.clone()
-        };
-        self.k = Some(k.clone());
-        Ok(k)
-    }
-
-    pub fn update_v(&mut self, v: &Tensor) -> Result<Tensor> {
-        let v = if let Some(prev_v) = &self.v {
-            Tensor::cat(&[prev_v, v], 2)?
-        } else {
-            v.clone()
-        };
-        self.v = Some(v.clone());
-        Ok(v)
-    }
-
-    /// Get K cache sum for debugging. Returns 0.0 if cache is empty.
-    pub fn k_sum(&self) -> Result<f32> {
-        match &self.k {
-            Some(k) => {
-                let vals: Vec<f32> = k
-                    .to_dtype(candle_core::DType::F32)?
-                    .flatten_all()?
-                    .to_vec1()?;
-                Ok(vals.iter().sum())
-            }
-            None => Ok(0.0),
-        }
-    }
-
-    /// Get V cache sum for debugging. Returns 0.0 if cache is empty.
-    pub fn v_sum(&self) -> Result<f32> {
-        match &self.v {
-            Some(v) => {
-                let vals: Vec<f32> = v
-                    .to_dtype(candle_core::DType::F32)?
-                    .flatten_all()?
-                    .to_vec1()?;
-                Ok(vals.iter().sum())
-            }
-            None => Ok(0.0),
-        }
-    }
-
-    /// Get K cache shape for debugging.
-    pub fn k_shape(&self) -> Option<Vec<usize>> {
-        self.k.as_ref().map(|k| k.dims().to_vec())
-    }
-
-    pub fn reset(&mut self) {
-        self.k = None;
-        self.v = None;
-    }
-}
+// KVCache, PreAllocKVCache, and AnyKVCache are defined in kv_cache.rs
+pub use super::kv_cache::{AnyKVCache, KVCache, PreAllocKVCache};
 
 #[cfg(test)]
 mod tests {
@@ -685,7 +610,7 @@ mod tests {
 
         let attn = Attention::new(&config, vb).unwrap();
         let rope = RoPEType::Standard(RotaryEmbedding::new(16, 512, 10000.0, &device).unwrap());
-        let mut cache = KVCache::new();
+        let mut cache = AnyKVCache::Concat(KVCache::new());
 
         // First forward
         let input1 = Tensor::randn(0.0f32, 1.0, (1, 5, 64), &device).unwrap();
@@ -710,7 +635,7 @@ mod tests {
 
         let layer = DecoderLayer::new(&config, vb).unwrap();
         let rope = RoPEType::Standard(RotaryEmbedding::new(16, 512, 10000.0, &device).unwrap());
-        let mut cache = KVCache::new();
+        let mut cache = AnyKVCache::Concat(KVCache::new());
 
         let input = Tensor::randn(0.0f32, 1.0, (1, 8, 64), &device).unwrap();
         let output = layer
@@ -723,7 +648,8 @@ mod tests {
     #[test]
     fn test_qwen3_tts_kv_caches_creation() {
         // Test that KV caches can be created for a model
-        let kv_caches: Vec<KVCache> = (0..2).map(|_| KVCache::new()).collect();
+        let kv_caches: Vec<AnyKVCache> =
+            (0..2).map(|_| AnyKVCache::Concat(KVCache::new())).collect();
         // Just verify KV caches can be created
         assert_eq!(kv_caches.len(), 2);
     }

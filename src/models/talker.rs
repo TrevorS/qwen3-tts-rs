@@ -23,7 +23,8 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use super::config::Qwen3TTSConfig;
-use super::transformer::{DecoderLayer, KVCache, MRoPE, RoPEType, RotaryEmbedding};
+use super::kv_cache::{AnyKVCache, KVCache, PreAllocKVCache};
+use super::transformer::{DecoderLayer, MRoPE, RoPEType, RotaryEmbedding};
 
 /// ChatML special token IDs
 pub mod special_tokens {
@@ -452,7 +453,7 @@ impl TalkerModel {
         text_tokens: &[u32],
         speaker: Speaker,
         language: Language,
-        kv_caches: &mut [KVCache],
+        kv_caches: &mut [AnyKVCache],
     ) -> Result<(Tensor, Tensor)> {
         use codec_tokens::*;
 
@@ -513,7 +514,7 @@ impl TalkerModel {
         speaker_embed: &Tensor,
         language: Language,
         icl_mode: bool,
-        kv_caches: &mut [KVCache],
+        kv_caches: &mut [AnyKVCache],
     ) -> Result<(Tensor, Tensor)> {
         use codec_tokens::*;
 
@@ -586,7 +587,7 @@ impl TalkerModel {
         text_tokens: &[u32],
         instruct_tokens: &[u32],
         language: Language,
-        kv_caches: &mut [KVCache],
+        kv_caches: &mut [AnyKVCache],
     ) -> Result<(Tensor, Tensor)> {
         use codec_tokens::*;
 
@@ -715,7 +716,7 @@ impl TalkerModel {
     pub fn generate_step_with_embed(
         &self,
         input_embed: &Tensor,
-        kv_caches: &mut [KVCache],
+        kv_caches: &mut [AnyKVCache],
         offset: usize,
     ) -> Result<(Tensor, Tensor)> {
         // Single token attending to all previous positions via KV cache —
@@ -809,7 +810,7 @@ impl TalkerModel {
     pub fn prefill(
         &self,
         input_ids: &Tensor,
-        kv_caches: &mut [KVCache],
+        kv_caches: &mut [AnyKVCache],
     ) -> Result<(Tensor, Tensor)> {
         let embed = self.text_embedding.forward(input_ids)?;
         let projected = self.text_projection.forward(&embed)?;
@@ -822,7 +823,7 @@ impl TalkerModel {
     fn run_prefill_layers(
         &self,
         mut hidden: Tensor,
-        kv_caches: &mut [KVCache],
+        kv_caches: &mut [AnyKVCache],
     ) -> Result<(Tensor, Tensor)> {
         let seq_len = hidden.dim(1)?;
         let mask = self.create_causal_mask(seq_len, 0)?;
@@ -887,16 +888,44 @@ impl TalkerModel {
     }
 
     /// Create new KV caches for generation
-    pub fn new_kv_caches(&self) -> Vec<KVCache> {
-        (0..self.config.num_hidden_layers)
-            .map(|_| KVCache::new())
-            .collect()
+    pub fn new_kv_caches(&self, max_seq: usize) -> Vec<AnyKVCache> {
+        if self.device.is_cuda() && max_seq > 0 {
+            let dtype = self.codec_head.weight().dtype();
+            (0..self.config.num_hidden_layers)
+                .map(|_| {
+                    PreAllocKVCache::new(
+                        1, // batch
+                        self.config.num_key_value_heads,
+                        max_seq,
+                        self.config.head_dim,
+                        dtype,
+                        &self.device,
+                    )
+                    .map(AnyKVCache::PreAlloc)
+                    .unwrap_or_else(|_| AnyKVCache::Concat(KVCache::new()))
+                })
+                .collect()
+        } else {
+            (0..self.config.num_hidden_layers)
+                .map(|_| AnyKVCache::Concat(KVCache::new()))
+                .collect()
+        }
     }
 
     /// Get codec embedding for a token (used by code predictor)
     pub fn get_codec_embedding(&self, token_id: u32) -> Result<Tensor> {
         let token_tensor = Tensor::new(&[token_id], &self.device)?;
         let embed = self.codec_embedding.forward(&token_tensor)?;
+        Ok(embed.unsqueeze(0)?) // [1, 1, hidden_size]
+    }
+
+    /// Look up codec embedding from a GPU-resident token tensor.
+    ///
+    /// Avoids the CPU→GPU roundtrip of creating a new tensor from a u32.
+    /// `token` should be a scalar or 1-element tensor of token indices.
+    pub fn get_codec_embedding_from_tensor(&self, token: &Tensor) -> Result<Tensor> {
+        let token = token.flatten_all()?;
+        let embed = self.codec_embedding.forward(&token)?;
         Ok(embed.unsqueeze(0)?) // [1, 1, hidden_size]
     }
 

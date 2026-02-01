@@ -95,8 +95,8 @@ sampled semantic token for the next iteration's embedding lookup).
 Previously eliminated:
 
 1. **Code predictor**: Batched argmax — 15 of 16 per-frame `to_vec1` calls removed
-2. **Sampling**: GPU-side top-k/top-p filtering — no logit vector transfer
-3. **Token suppression**: GPU-native ops with cached suppression mask
+1. **Sampling**: GPU-side top-k/top-p filtering — no logit vector transfer
+1. **Token suppression**: GPU-native ops with cached suppression mask
 
 ## Overhead
 

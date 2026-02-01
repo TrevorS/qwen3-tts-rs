@@ -1338,8 +1338,8 @@ fn test_code_predictor_module() -> Result<()> {
     let talker_hidden = cp_input.narrow(1, 0, 1)?; // [1, 1, 1024]
 
     // Run prefill with just talker hidden
-    let mut kv_caches: Vec<qwen3_tts::models::transformer::KVCache> = (0..config.num_hidden_layers)
-        .map(|_| qwen3_tts::models::transformer::KVCache::new())
+    let mut kv_caches: Vec<qwen3_tts::models::AnyKVCache> = (0..config.num_hidden_layers)
+        .map(|_| qwen3_tts::models::AnyKVCache::Concat(qwen3_tts::models::KVCache::new()))
         .collect();
 
     let hidden = predictor.forward_prefill(&talker_hidden, &[], &mut kv_caches)?;
@@ -2880,7 +2880,6 @@ fn test_talker_model_forward() -> Result<()> {
 fn test_talker_model_prefill() -> Result<()> {
     // Test the TalkerModel prefill with KV caching
     use qwen3_tts::models::talker::TalkerModel;
-    use qwen3_tts::models::KVCache;
 
     if !reference_available() {
         return Ok(());
@@ -2895,7 +2894,7 @@ fn test_talker_model_prefill() -> Result<()> {
     let talker = TalkerModel::from_weights(&weights, &device)?;
 
     // Create KV caches
-    let mut kv_caches: Vec<KVCache> = talker.new_kv_caches();
+    let mut kv_caches = talker.new_kv_caches(2048);
 
     // Input: "Hello, this is a" = [9707, 11, 419, 374, 264]
     let input_ids = Tensor::new(&[9707u32, 11, 419, 374, 264], &device)?.unsqueeze(0)?;
@@ -3009,7 +3008,6 @@ fn test_autoregressive_generation() -> Result<()> {
     use qwen3_tts::models::code_predictor::{CodePredictor, CodePredictorConfig};
     use qwen3_tts::models::codec::Decoder12Hz;
     use qwen3_tts::models::talker::TalkerModel;
-    use qwen3_tts::models::KVCache;
 
     if !reference_available() {
         eprintln!("Reference values not found. Run: python3 tools/export_reference_values.py");
@@ -3084,7 +3082,7 @@ fn test_autoregressive_generation() -> Result<()> {
     println!("  Input IDs: {:?}", input_ids.dims());
 
     // Create KV caches for talker
-    let mut talker_kv_caches: Vec<KVCache> = talker.new_kv_caches();
+    let mut talker_kv_caches = talker.new_kv_caches(2048);
 
     // Prefill talker with text
     let (hidden, logits) = talker.prefill(&input_ids, &mut talker_kv_caches)?;
@@ -3118,11 +3116,12 @@ fn test_autoregressive_generation() -> Result<()> {
 
     // Generate 5 frames
     let mut all_codes: Vec<Vec<u32>> = Vec::new();
+    let mut cp_kv_caches = code_predictor.new_kv_caches();
 
     // First frame
     let semantic_embed = talker.get_codec_embedding(first_token_id)?;
     let acoustic_codes = code_predictor
-        .generate_acoustic_codes(&last_hidden, &semantic_embed)?
+        .generate_acoustic_codes(&last_hidden, &semantic_embed, &mut cp_kv_caches)?
         .0;
     println!(
         "  Frame 0: semantic={}, acoustics={:?}",
@@ -3149,7 +3148,7 @@ fn test_autoregressive_generation() -> Result<()> {
         // Generate acoustic tokens
         let semantic_embed = talker.get_codec_embedding(next_token_id)?;
         let acoustic_codes = code_predictor
-            .generate_acoustic_codes(&last_hidden, &semantic_embed)?
+            .generate_acoustic_codes(&last_hidden, &semantic_embed, &mut cp_kv_caches)?
             .0;
         println!(
             "  Frame {}: semantic={}, acoustics={:?}",
