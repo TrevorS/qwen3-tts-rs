@@ -99,7 +99,7 @@ use std::time::Instant;
 
 use models::codec::{Decoder12Hz, Encoder12Hz};
 use models::speaker::SpeakerEncoder;
-use models::KVCache;
+use models::AnyKVCache;
 
 // SynthesisTiming is defined above, already public.
 
@@ -447,7 +447,7 @@ impl Qwen3TTS {
         sync_device(&self.device)?;
         let t_prefill = Instant::now();
 
-        let mut kv_caches = self.talker.new_kv_caches();
+        let mut kv_caches = self.talker.new_kv_caches(gen_config.max_new_tokens + 256);
         let (hidden, logits) =
             self.talker
                 .prefill_custom_voice(&input_ids, speaker, language, &mut kv_caches)?;
@@ -531,7 +531,7 @@ impl Qwen3TTS {
         &self,
         gen_config: &generation::GenerationConfig,
         sampling_ctx: &mut generation::SamplingContext,
-        kv_caches: &mut [KVCache],
+        kv_caches: &mut [AnyKVCache],
         mut offset: usize,
         mut last_hidden: Tensor,
         initial_logits: &Tensor,
@@ -548,6 +548,9 @@ impl Qwen3TTS {
             &self.device,
         )?;
 
+        // Pre-allocate code predictor KV caches (reused + reset each frame)
+        let mut cp_kv_caches = self.code_predictor.new_kv_caches();
+
         // Sample first semantic token
         let logits_2d = initial_logits.squeeze(1)?;
         let logits_2d = self.apply_generation_penalties(
@@ -557,9 +560,9 @@ impl Qwen3TTS {
             0,
             Some(&suppression_mask),
         )?;
-        let first_token = generation::sample(&logits_2d, gen_config, sampling_ctx)?;
+        let mut semantic_token_tensor = generation::sample(&logits_2d, gen_config, sampling_ctx)?;
         tracing::trace!(target: "gpu_sync", "to_vec1 in generate_codes first token");
-        let mut semantic_token: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
+        let mut semantic_token: u32 = semantic_token_tensor.flatten_all()?.to_vec1::<u32>()?[0];
         generated_tokens.push(semantic_token);
 
         let mut all_codes: FrameCodes = Vec::new();
@@ -574,14 +577,17 @@ impl Qwen3TTS {
                 }
             }
 
-            let semantic_embed = self.talker.get_codec_embedding(semantic_token)?;
+            // Embedding lookup using GPU-resident token tensor (no CPU→GPU roundtrip)
+            let semantic_embed = self
+                .talker
+                .get_codec_embedding_from_tensor(&semantic_token_tensor)?;
 
             #[cfg(feature = "profiling")]
             let _cp_span = tracing::info_span!("code_predictor", frame = frame_idx).entered();
 
             let (acoustic_codes, acoustic_codes_tensor) = self
                 .code_predictor
-                .generate_acoustic_codes(&last_hidden, &semantic_embed)?;
+                .generate_acoustic_codes(&last_hidden, &semantic_embed, &mut cp_kv_caches)?;
 
             #[cfg(feature = "profiling")]
             drop(_cp_span);
@@ -626,9 +632,9 @@ impl Qwen3TTS {
                 generated_tokens.len(),
                 Some(&suppression_mask),
             )?;
-            let next_token = generation::sample(&logits_2d, gen_config, sampling_ctx)?;
+            semantic_token_tensor = generation::sample(&logits_2d, gen_config, sampling_ctx)?;
             tracing::trace!(target: "gpu_sync", "to_vec1 in generate_codes sampling");
-            semantic_token = next_token.flatten_all()?.to_vec1::<u32>()?[0];
+            semantic_token = semantic_token_tensor.flatten_all()?.to_vec1::<u32>()?[0];
             generated_tokens.push(semantic_token);
         }
 
@@ -699,7 +705,7 @@ impl Qwen3TTS {
         #[cfg(feature = "profiling")]
         let _prefill_span = tracing::info_span!("prefill").entered();
 
-        let mut kv_caches = self.talker.new_kv_caches();
+        let mut kv_caches = self.talker.new_kv_caches(gen_config.max_new_tokens + 256);
         let (hidden, logits) =
             self.talker
                 .prefill_custom_voice(&input_ids, speaker, language, &mut kv_caches)?;
@@ -782,7 +788,7 @@ impl Qwen3TTS {
         #[cfg(feature = "profiling")]
         let _prefill_span = tracing::info_span!("prefill").entered();
 
-        let mut kv_caches = self.talker.new_kv_caches();
+        let mut kv_caches = self.talker.new_kv_caches(gen_config.max_new_tokens + 256);
         let (hidden, logits) = self.talker.prefill_voice_design(
             &input_ids,
             &instruct_ids,
@@ -881,7 +887,7 @@ impl Qwen3TTS {
         #[cfg(feature = "profiling")]
         let _prefill_span = tracing::info_span!("prefill").entered();
 
-        let mut kv_caches = self.talker.new_kv_caches();
+        let mut kv_caches = self.talker.new_kv_caches(gen_config.max_new_tokens + 256);
         let (hidden, logits) = self.talker.prefill_voice_clone(
             &input_ids,
             &speaker_embed,
@@ -1390,10 +1396,11 @@ pub struct StreamingSession<'a> {
     model: &'a Qwen3TTS,
     config: generation::GenerationConfig,
     sampling_ctx: generation::SamplingContext,
-    kv_caches: Vec<KVCache>,
+    kv_caches: Vec<AnyKVCache>,
     offset: usize,
     last_hidden: Tensor,
     current_token: Option<u32>,
+    current_token_tensor: Option<Tensor>,
     frames_generated: usize,
     frame_buffer: FrameCodes,
     chunk_frames: usize,
@@ -1406,6 +1413,8 @@ pub struct StreamingSession<'a> {
     generated_tokens: Vec<u32>,
     // Pre-built suppression mask (reused every frame)
     suppression_mask: generation::SuppressionMask,
+    // Pre-allocated code predictor KV caches (reused + reset each frame)
+    cp_kv_caches: Vec<AnyKVCache>,
 }
 
 impl<'a> StreamingSession<'a> {
@@ -1423,7 +1432,7 @@ impl<'a> StreamingSession<'a> {
             model.build_trailing_text(input_ids)?;
 
         // Prefill with CustomVoice format
-        let mut kv_caches = model.talker.new_kv_caches();
+        let mut kv_caches = model.talker.new_kv_caches(config.max_new_tokens + 256);
         let (hidden, logits) =
             model
                 .talker
@@ -1453,6 +1462,7 @@ impl<'a> StreamingSession<'a> {
         generated_tokens.push(first_token_id);
 
         let done = config.eos_token_id == Some(first_token_id);
+        let cp_kv_caches = model.code_predictor.new_kv_caches();
 
         Ok(Self {
             model,
@@ -1462,6 +1472,7 @@ impl<'a> StreamingSession<'a> {
             offset: prefill_len,
             last_hidden,
             current_token: if done { None } else { Some(first_token_id) },
+            current_token_tensor: if done { None } else { Some(first_token) },
             frames_generated: 0,
             frame_buffer: Vec::new(),
             chunk_frames: options.chunk_frames,
@@ -1471,6 +1482,7 @@ impl<'a> StreamingSession<'a> {
             tts_pad_embed,
             generated_tokens,
             suppression_mask,
+            cp_kv_caches,
         })
     }
 
@@ -1493,21 +1505,28 @@ impl<'a> StreamingSession<'a> {
         while self.frame_buffer.len() < self.chunk_frames
             && self.frames_generated < self.config.max_new_tokens
         {
-            let token_id = match self.current_token {
-                Some(id) => id,
-                None => {
-                    self.done = true;
-                    break;
-                }
-            };
+            let (token_id, token_tensor) =
+                match (self.current_token, self.current_token_tensor.take()) {
+                    (Some(id), Some(t)) => (id, t),
+                    _ => {
+                        self.done = true;
+                        break;
+                    }
+                };
 
-            let semantic_embed = self.model.talker.get_codec_embedding(token_id)?;
+            // Embedding lookup using GPU-resident token tensor (no CPU→GPU roundtrip)
+            let semantic_embed = self
+                .model
+                .talker
+                .get_codec_embedding_from_tensor(&token_tensor)?;
 
             // Generate 15 acoustic codes
-            let (acoustic_codes, acoustic_codes_tensor) = self
-                .model
-                .code_predictor
-                .generate_acoustic_codes(&self.last_hidden, &semantic_embed)?;
+            let (acoustic_codes, acoustic_codes_tensor) =
+                self.model.code_predictor.generate_acoustic_codes(
+                    &self.last_hidden,
+                    &semantic_embed,
+                    &mut self.cp_kv_caches,
+                )?;
 
             let mut frame_codes = vec![token_id];
             frame_codes.extend(&acoustic_codes);
@@ -1549,15 +1568,18 @@ impl<'a> StreamingSession<'a> {
                 self.generated_tokens.len(),
                 Some(&self.suppression_mask),
             )?;
-            let next_token = generation::sample(&logits_2d, &self.config, &mut self.sampling_ctx)?;
-            let next_token_id: u32 = next_token.flatten_all()?.to_vec1::<u32>()?[0];
+            let next_token_tensor =
+                generation::sample(&logits_2d, &self.config, &mut self.sampling_ctx)?;
+            let next_token_id: u32 = next_token_tensor.flatten_all()?.to_vec1::<u32>()?[0];
             self.generated_tokens.push(next_token_id);
 
             if self.config.eos_token_id == Some(next_token_id) {
                 self.current_token = None;
+                self.current_token_tensor = None;
                 self.done = true;
             } else {
                 self.current_token = Some(next_token_id);
+                self.current_token_tensor = Some(next_token_tensor);
             }
         }
 
