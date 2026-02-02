@@ -284,8 +284,7 @@ impl Attention {
         };
 
         // ---- Attention computation ----
-        // When compiled with flash-attn, use it on CUDA and fall back to
-        // standard attention on CPU. Without the feature, always use standard.
+        // Priority: flash-attn (CUDA) > Metal SDPA > manual matmul fallback
 
         #[cfg(feature = "flash-attn")]
         let use_flash = q.device().is_cuda();
@@ -324,18 +323,37 @@ impl Attention {
             }
             #[cfg(not(feature = "flash-attn"))]
             unreachable!()
+        } else if q.device().is_metal() && attention_mask.is_none() {
+            // Metal SDPA for decode steps (seq_len=1, no mask needed).
+            // Fused tiled kernel with native GQA; 2-pass for k_seq >= 1024.
+            // Layout: [B, H, S, D] — already in this form after transpose.
+            let q = q.contiguous()?;
+            let k = k.contiguous()?;
+            let v = v.contiguous()?;
+            let attn_output = candle_nn::ops::sdpa(
+                &q,
+                &k,
+                &v,
+                /* mask */ None,
+                /* causal */ true,
+                self.scale as f32,
+                /* softcapping */ 1.0,
+            )?;
+            attn_output.transpose(1, 2)?.reshape((
+                batch,
+                seq_len,
+                self.num_heads * self.head_dim,
+            ))?
         } else {
-            // Manual scaled dot-product attention with GQA repeat
+            // CPU/CUDA-without-flash fallback: manual scaled dot-product attention
             let k = self.repeat_kv(&k)?;
             let v = self.repeat_kv(&v)?;
-            // Ensure contiguous layout for CUDA matmul (transpose creates non-contiguous views)
             let q = q.contiguous()?;
             let k = k.contiguous()?;
             let v = v.contiguous()?;
             let attn_weights =
                 (q.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)? * self.scale)?;
             let attn_weights = if let Some(mask) = attention_mask {
-                // Cast mask to match attn_weights dtype (e.g. f32 mask with bf16 weights)
                 let mask = mask.to_dtype(attn_weights.dtype())?;
                 attn_weights.broadcast_add(&mask)?
             } else {
