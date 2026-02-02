@@ -612,11 +612,12 @@ fn main() -> Result<()> {
         let semantic_embed = talker.get_codec_embedding(semantic_token)?;
 
         // Generate 15 acoustic codes using code predictor
-        let (acoustic_codes, _) = code_predictor.generate_acoustic_codes(
+        let acoustic_codes_tensor = code_predictor.generate_acoustic_codes(
             &last_hidden,
             &semantic_embed,
             &mut cp_kv_caches,
         )?;
+        let acoustic_codes: Vec<u32> = acoustic_codes_tensor.to_vec1()?;
 
         if frame_idx < 5 || frame_idx == num_frames - 1 {
             println!(
