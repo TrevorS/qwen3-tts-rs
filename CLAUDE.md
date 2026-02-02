@@ -10,7 +10,7 @@ cargo build --release --features cuda,cli      # CUDA release with CLI
 cargo test --lib                               # Unit tests (no model weights needed)
 cargo test --test integration                  # Integration tests (no weights)
 cargo test --lib -- generation::sampling       # Single test module
-cargo clippy --lib -- -D warnings              # Lint
+cargo clippy --features cli,hub -- -D warnings  # Lint (matches CI)
 cargo fmt -- --check                           # Format check
 cargo bench                                    # Criterion micro-benchmarks (no weights)
 ```
