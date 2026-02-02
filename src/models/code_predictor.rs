@@ -285,7 +285,7 @@ impl CodePredictor {
 
         (0..self.config.num_hidden_layers)
             .map(|_| {
-                if self.device.is_cuda() {
+                if self.device.is_cuda() || self.device.is_metal() {
                     PreAllocKVCache::new(
                         1, // batch
                         self.config.num_key_value_heads,

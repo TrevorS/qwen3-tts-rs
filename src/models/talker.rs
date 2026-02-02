@@ -889,7 +889,7 @@ impl TalkerModel {
 
     /// Create new KV caches for generation
     pub fn new_kv_caches(&self, max_seq: usize) -> Vec<AnyKVCache> {
-        if self.device.is_cuda() && max_seq > 0 {
+        if (self.device.is_cuda() || self.device.is_metal()) && max_seq > 0 {
             let dtype = self.codec_head.weight().dtype();
             (0..self.config.num_hidden_layers)
                 .map(|_| {

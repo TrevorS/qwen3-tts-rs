@@ -2,9 +2,9 @@
 //!
 //! Provides two variants:
 //! - [`KVCache`]: Concatenation-based (works on all backends).
-//! - [`PreAllocKVCache`]: Pre-allocated fixed-size buffer with in-place writes
-//!   via `copy2d`. Zero allocation during generation. Falls back to
-//!   concatenation on CPU when the CUDA feature is not enabled.
+//! - [`PreAllocKVCache`]: Pre-allocated fixed-size buffer with in-place writes.
+//!   Uses `InplaceOp2` + `copy2d` on CUDA, `slice_set` on Metal/CPU.
+//!   Zero allocation during generation on CUDA and Metal.
 
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
@@ -228,8 +228,9 @@ impl InplaceOp2 for KVCacheAppend {
 /// Pre-allocated KV cache with in-place writes.
 ///
 /// Allocates fixed-size K and V buffers at construction time. During generation,
-/// new K/V data is written in-place via `copy2d` (CUDA) or `Tensor::cat` fallback
-/// (CPU/Metal), avoiding allocation and full-buffer copies.
+/// new K/V data is written in-place via `InplaceOp2` + `copy2d` (CUDA) or
+/// `Tensor::slice_set` (Metal/CPU), avoiding allocation and full-buffer copies.
+#[allow(dead_code)] // num_heads and head_dim are used in the CUDA InplaceOp2 path
 pub struct PreAllocKVCache {
     /// Pre-allocated K buffer: `[batch, num_heads, max_seq, head_dim]`
     k_buf: Tensor,
@@ -243,7 +244,7 @@ pub struct PreAllocKVCache {
     num_heads: usize,
     /// Head dimension
     head_dim: usize,
-    /// Whether to use in-place CUDA path
+    /// Whether to use CUDA InplaceOp2 path (false = use slice_set fallback)
     use_inplace: bool,
 }
 
@@ -339,21 +340,9 @@ impl PreAllocKVCache {
             }
         }
 
-        // CPU/Metal fallback: use slice_assign (not ideal, but functional)
-        // This path is not performance-critical since CPU/Metal inference is
-        // already much slower.
-        let _new_buf = buf.slice_assign(
-            &[
-                0..1,
-                0..self.num_heads,
-                pos..pos + new_seq,
-                0..self.head_dim,
-            ],
-            src,
-        )?;
-        // slice_assign returns a new tensor; we can't actually update buf in-place
-        // on CPU. For now this is a no-op — the concat-based KVCache should be used
-        // on CPU/Metal instead.
+        // Metal/CPU fallback: slice_set writes in-place via copy2d (blit on Metal).
+        let src_contiguous = src.contiguous()?;
+        buf.slice_set(&src_contiguous, 2, pos)?;
         Ok(())
     }
 
