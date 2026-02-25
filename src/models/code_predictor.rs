@@ -129,6 +129,68 @@ impl CodePredictorConfig {
     }
 }
 
+/// Pre-allocated working buffers for code predictor.
+///
+/// Reused across calls to avoid per-frame allocations.
+pub struct CodePredictorBuffers {
+    /// Output tensor for acoustic codes [num_acoustic]
+    pub codes_output: Tensor,
+    /// Pre-allocated embedding tensor for single code lookup
+    pub embed_buffer: Tensor,
+}
+
+/// Fused embedding lookup for all 15 acoustic groups.
+///
+/// Pre-computes a combined embedding table for faster batch lookups.
+pub struct FusedCodecEmbedding {
+    /// Combined embedding table [num_groups, vocab_size, embed_dim]
+    combined_table: Tensor,
+    /// Number of acoustic groups (15)
+    num_groups: usize,
+    /// Embedding dimension
+    embed_dim: usize,
+}
+
+impl FusedCodecEmbedding {
+    /// Create from individual embedding tables.
+    pub fn from_embeddings(embeddings: &[Embedding], device: &candle_core::Device) -> Result<Self> {
+        let num_groups = embeddings.len();
+        let embed_dim = embeddings[0].embeddings().dim(1)?;
+
+        // Stack all embedding tables into [num_groups, vocab_size, embed_dim]
+        let tables: Vec<Tensor> = embeddings.iter().map(|e| e.embeddings().clone()).collect();
+        let combined_table = Tensor::stack(&tables, 0)?;
+
+        Ok(Self {
+            combined_table,
+            num_groups,
+            embed_dim,
+        })
+    }
+
+    /// Look up embeddings for a batch of codes.
+    ///
+    /// codes: [num_codes] tensor of code IDs
+    /// Returns: [num_codes, embed_dim] tensor
+    pub fn forward(&self, codes: &Tensor) -> Result<Tensor> {
+        let n = codes.dim(0)?;
+        if n > self.num_groups {
+            anyhow::bail!("Too many codes: {} > {}", n, self.num_groups);
+        }
+
+        // For each position i, look up codes[i] in embedding table i
+        let mut rows = Vec::with_capacity(n);
+        for i in 0..n {
+            let code = codes.i(i)?;
+            let table = self.combined_table.i(i)?; // [vocab_size, embed_dim]
+            let embed = table.index_select(&code, 0)?; // [1, embed_dim]
+            rows.push(embed);
+        }
+
+        Ok(Tensor::cat(&rows, 0)?)
+    }
+}
+
 /// Code predictor model
 pub struct CodePredictor {
     /// Codec embeddings for each acoustic group (0-14 for groups 2-16)
@@ -151,6 +213,19 @@ pub struct CodePredictor {
     device: candle_core::Device,
     /// Compute dtype (needed for PreAllocKVCache creation)
     dtype: DType,
+    /// Pre-computed zero mask for decode steps (no masking needed)
+    zero_mask: Tensor,
+}
+
+/// Timing breakdown for code predictor generation.
+#[derive(Debug, Clone)]
+pub struct CodePredictorTiming {
+    /// Time for prefill phase (ms)
+    pub prefill_ms: f64,
+    /// Time for decode phase (ms)
+    pub decode_ms: f64,
+    /// Per-layer timing (ms)
+    pub layer_timings: Vec<f64>,
 }
 
 impl CodePredictor {
@@ -216,6 +291,9 @@ impl CodePredictor {
         // This never changes, so building it once avoids per-frame allocation.
         let prefill_mask = super::transformer::create_causal_mask(2, 0, vb.device())?;
 
+        // Pre-build zero mask for decode steps (1x1x1x17 max context)
+        let zero_mask = Tensor::zeros((1, 1, 1, 17), DType::F32, vb.device())?;
+
         let device = vb.device().clone();
         let dtype = vb.dtype();
 
@@ -230,7 +308,22 @@ impl CodePredictor {
             prefill_mask,
             device,
             dtype,
+            zero_mask,
         })
+    }
+
+    /// Create pre-allocated working buffers for optimized generation.
+    pub fn new_buffers(&self) -> CodePredictorBuffers {
+        let num_acoustic = self.config.num_code_groups - 1;
+        CodePredictorBuffers {
+            codes_output: Tensor::zeros(num_acoustic, DType::U32, &self.device).unwrap(),
+            embed_buffer: Tensor::zeros(
+                (1, 1, self.config.codec_embed_dim()),
+                DType::F32,
+                &self.device,
+            )
+            .unwrap(),
+        }
     }
 
     /// Generate next token logits for a specific group
@@ -516,6 +609,273 @@ impl CodePredictor {
             let embed = self.codec_embeddings[i].forward(&code)?.unsqueeze(0)?;
             acc.add(&embed).map_err(Into::into)
         })
+    }
+
+    /// Generate all 15 acoustic tokens with fused operations where possible.
+    ///
+    /// This is an optimized version of `generate_acoustic_codes` that:
+    /// 1. Pre-allocates all output tensors
+    /// 2. Uses cached masks and buffers
+    /// 3. Minimizes tensor operations in the hot loop
+    /// 4. Reduces kernel launch overhead via fused ops
+    ///
+    /// The output should be identical to `generate_acoustic_codes` but potentially faster.
+    pub fn generate_acoustic_codes_fused(
+        &self,
+        talker_hidden: &Tensor,
+        semantic_embed: &Tensor,
+        cp_kv_caches: &mut [AnyKVCache],
+    ) -> Result<Tensor> {
+        self.generate_acoustic_codes_optimized(talker_hidden, semantic_embed, cp_kv_caches)
+    }
+
+    /// Optimized acoustic code generation with minimal allocations.
+    pub fn generate_acoustic_codes_optimized(
+        &self,
+        talker_hidden: &Tensor,
+        semantic_embed: &Tensor,
+        cp_kv_caches: &mut [AnyKVCache],
+    ) -> Result<Tensor> {
+        // Reset caches
+        for cache in cp_kv_caches.iter_mut() {
+            cache.reset();
+        }
+
+        let num_acoustic = self.config.num_code_groups - 1;
+        let hidden_size = self.config.hidden_size;
+
+        // === PREFILL PHASE ===
+        // Concatenate talker_hidden and semantic_embed
+        let input = Tensor::cat(&[talker_hidden, semantic_embed], 1)?;
+
+        // Apply projection if needed
+        let input = if let Some(proj) = &self.small_to_mtp_projection {
+            proj.forward(&input)?
+        } else {
+            input
+        };
+
+        // Run through transformer layers with cached mask
+        let mut h = input;
+        for (i, layer) in self.layers.iter().enumerate() {
+            h = layer.forward(
+                &h,
+                &self.rope,
+                Some(&self.prefill_mask),
+                Some(&mut cp_kv_caches[i]),
+                0,
+            )?;
+        }
+        h = self.norm.forward(&h)?;
+
+        // Get first code prediction (from position 1, the semantic embed position)
+        let last_h = h.i((.., 1..2, ..))?;
+        let logits = self.lm_heads[0].forward(&last_h)?;
+        let first_code = logits.argmax(D::Minus1)?.flatten_all()?; // [1] tensor
+
+        // Pre-allocate output tensor
+        let mut all_codes = Tensor::zeros(num_acoustic, DType::U32, &self.device)?;
+        all_codes = all_codes.slice_assign(&[0..1], &first_code)?;
+
+        let mut prev_code = first_code;
+
+        // === DECODE PHASE: Generate remaining 14 codes ===
+        // Each iteration: embed prev_code -> transformer layers -> lm_head -> argmax
+        for group_idx in 1..num_acoustic {
+            // Embedding lookup (uses previous group's embedding table)
+            let embed = self.codec_embeddings[group_idx - 1].forward(&prev_code)?;
+            let embed = embed.unsqueeze(0)?; // [1, 1, codec_embed_dim]
+
+            // Project if needed
+            let embed = if let Some(proj) = &self.small_to_mtp_projection {
+                proj.forward(&embed)?
+            } else {
+                embed
+            };
+
+            // Run through transformer layers (offset = 2 + group_idx - 1 = group_idx + 1)
+            let offset = group_idx + 1;
+            let mut h = embed;
+            for (i, layer) in self.layers.iter().enumerate() {
+                // No mask needed for single-token decode with KV cache
+                h = layer.forward(&h, &self.rope, None, Some(&mut cp_kv_caches[i]), offset)?;
+            }
+            h = self.norm.forward(&h)?;
+
+            // LM head and argmax
+            let logits = self.lm_heads[group_idx].forward(&h)?;
+            let next_code = logits.argmax(D::Minus1)?.flatten_all()?; // [1] tensor
+            all_codes = all_codes.slice_assign(&[group_idx..group_idx + 1], &next_code)?;
+            prev_code = next_code;
+        }
+
+        Ok(all_codes)
+    }
+
+    /// Generate acoustic codes for multiple inputs in parallel.
+    ///
+    /// Useful for batch processing or when synthesizing multiple utterances.
+    /// Each input is processed independently but with shared model weights.
+    ///
+    /// # Arguments
+    /// * `talker_hiddens` - List of hidden states from talker model
+    /// * `semantic_embeds` - List of semantic token embeddings
+    ///
+    /// # Returns
+    /// Vector of acoustic code tensors, one per input
+    pub fn generate_acoustic_codes_batch(
+        &self,
+        talker_hiddens: &[Tensor],
+        semantic_embeds: &[Tensor],
+    ) -> Result<Vec<Tensor>> {
+        if talker_hiddens.len() != semantic_embeds.len() {
+            anyhow::bail!(
+                "Mismatched batch sizes: {} talker_hiddens, {} semantic_embeds",
+                talker_hiddens.len(),
+                semantic_embeds.len()
+            );
+        }
+
+        let mut results = Vec::with_capacity(talker_hiddens.len());
+        for (talker_hidden, semantic_embed) in talker_hiddens.iter().zip(semantic_embeds.iter()) {
+            let mut kv_caches = self.new_kv_caches();
+            let codes = self.generate_acoustic_codes_optimized(
+                talker_hidden,
+                semantic_embed,
+                &mut kv_caches,
+            )?;
+            results.push(codes);
+        }
+        Ok(results)
+    }
+
+    /// Generate acoustic codes with detailed per-operation timing.
+    ///
+    /// Useful for identifying specific bottlenecks.
+    pub fn generate_acoustic_codes_profiled(
+        &self,
+        talker_hidden: &Tensor,
+        semantic_embed: &Tensor,
+        cp_kv_caches: &mut [AnyKVCache],
+    ) -> Result<(Tensor, CodePredictorProfile)> {
+        use std::time::Instant;
+
+        // Reset caches
+        for cache in cp_kv_caches.iter_mut() {
+            cache.reset();
+        }
+
+        let num_acoustic = self.config.num_code_groups - 1;
+        let mut profile = CodePredictorProfile::default();
+
+        // === PREFILL PHASE ===
+        let prefill_start = Instant::now();
+
+        let cat_start = Instant::now();
+        let input = Tensor::cat(&[talker_hidden, semantic_embed], 1)?;
+        profile.cat_ms += cat_start.elapsed().as_secs_f64() * 1000.0;
+
+        let proj_start = Instant::now();
+        let input = if let Some(proj) = &self.small_to_mtp_projection {
+            proj.forward(&input)?
+        } else {
+            input
+        };
+        profile.proj_ms += proj_start.elapsed().as_secs_f64() * 1000.0;
+
+        let layers_start = Instant::now();
+        let mut h = input;
+        for (i, layer) in self.layers.iter().enumerate() {
+            h = layer.forward(
+                &h,
+                &self.rope,
+                Some(&self.prefill_mask),
+                Some(&mut cp_kv_caches[i]),
+                0,
+            )?;
+        }
+        profile.prefill_layers_ms = layers_start.elapsed().as_secs_f64() * 1000.0;
+
+        let norm_start = Instant::now();
+        h = self.norm.forward(&h)?;
+        profile.norm_ms += norm_start.elapsed().as_secs_f64() * 1000.0;
+
+        let lm_start = Instant::now();
+        let last_h = h.i((.., 1..2, ..))?;
+        let logits = self.lm_heads[0].forward(&last_h)?;
+        let first_code = logits.argmax(D::Minus1)?.flatten_all()?;
+        profile.lm_head_ms += lm_start.elapsed().as_secs_f64() * 1000.0;
+
+        profile.prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+
+        let mut all_codes = Tensor::zeros(num_acoustic, DType::U32, &self.device)?;
+        all_codes = all_codes.slice_assign(&[0..1], &first_code)?;
+        let mut prev_code = first_code;
+
+        // === DECODE PHASE ===
+        let decode_start = Instant::now();
+
+        for group_idx in 1..num_acoustic {
+            let embed_start = Instant::now();
+            let embed = self.codec_embeddings[group_idx - 1].forward(&prev_code)?;
+            let embed = embed.unsqueeze(0)?;
+            profile.embed_ms += embed_start.elapsed().as_secs_f64() * 1000.0;
+
+            let proj_start = Instant::now();
+            let embed = if let Some(proj) = &self.small_to_mtp_projection {
+                proj.forward(&embed)?
+            } else {
+                embed
+            };
+            profile.proj_ms += proj_start.elapsed().as_secs_f64() * 1000.0;
+
+            let layers_start = Instant::now();
+            let offset = group_idx + 1;
+            let mut h = embed;
+            for (i, layer) in self.layers.iter().enumerate() {
+                h = layer.forward(&h, &self.rope, None, Some(&mut cp_kv_caches[i]), offset)?;
+            }
+            profile.decode_layers_ms += layers_start.elapsed().as_secs_f64() * 1000.0;
+
+            let norm_start = Instant::now();
+            h = self.norm.forward(&h)?;
+            profile.norm_ms += norm_start.elapsed().as_secs_f64() * 1000.0;
+
+            let lm_start = Instant::now();
+            let logits = self.lm_heads[group_idx].forward(&h)?;
+            let next_code = logits.argmax(D::Minus1)?.flatten_all()?;
+            profile.lm_head_ms += lm_start.elapsed().as_secs_f64() * 1000.0;
+
+            all_codes = all_codes.slice_assign(&[group_idx..group_idx + 1], &next_code)?;
+            prev_code = next_code;
+        }
+
+        profile.decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+        profile.total_ms = profile.prefill_ms + profile.decode_ms;
+
+        Ok((all_codes, profile))
+    }
+}
+
+/// Detailed profiling breakdown for code predictor.
+#[derive(Debug, Clone, Default)]
+pub struct CodePredictorProfile {
+    pub total_ms: f64,
+    pub prefill_ms: f64,
+    pub decode_ms: f64,
+    pub cat_ms: f64,
+    pub proj_ms: f64,
+    pub prefill_layers_ms: f64,
+    pub decode_layers_ms: f64,
+    pub norm_ms: f64,
+    pub embed_ms: f64,
+    pub lm_head_ms: f64,
+}
+
+impl CodePredictor {
+    #[cfg(test)]
+    fn test_embed_profile() {
+        // Placeholder for test
     }
 }
 

@@ -253,6 +253,7 @@ mod end_to_end_mock {
             chunk_frames: 10,
             min_new_tokens: 2,
             seed: Some(42),
+            ..Default::default()
         };
 
         assert_eq!(options.max_length, 512);

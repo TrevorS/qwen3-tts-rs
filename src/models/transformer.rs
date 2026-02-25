@@ -391,6 +391,9 @@ pub struct MLP {
     gate_proj: Linear,
     up_proj: Linear,
     down_proj: Linear,
+    /// Fused gate+up projection weights [2*intermediate, hidden] for faster forward
+    /// When set, gate_proj and up_proj are not used directly
+    fused_gate_up: Option<Linear>,
 }
 
 impl MLP {
@@ -398,18 +401,46 @@ impl MLP {
         let hidden_size = config.hidden_size;
         let intermediate_size = config.intermediate_size;
 
+        let gate_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?;
+        let up_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?;
+        let down_proj = linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?;
+
+        // Create fused gate+up weights by concatenating along output dimension
+        // This allows a single matmul instead of two separate ones
+        let fused_gate_up = if let (Ok(gw), Ok(uw)) = (
+            gate_proj.weight().contiguous(),
+            up_proj.weight().contiguous(),
+        ) {
+            let fused_weight = Tensor::cat(&[gw, uw], 0)?; // [2*intermediate, hidden]
+            Some(Linear::new(fused_weight, None))
+        } else {
+            None
+        };
+
         Ok(Self {
-            gate_proj: linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?,
-            up_proj: linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?,
-            down_proj: linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?,
+            gate_proj,
+            up_proj,
+            down_proj,
+            fused_gate_up,
         })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = self.gate_proj.forward(x)?;
-        let gate = candle_nn::ops::silu(&gate)?;
-        let up = self.up_proj.forward(x)?;
-        Ok(self.down_proj.forward(&(gate * up)?)?)
+        if let Some(fused) = &self.fused_gate_up {
+            // Fused path: single matmul for gate+up
+            let intermediate_size = self.down_proj.weight().dim(1)?;
+            let combined = fused.forward(x)?; // [batch, seq, 2*intermediate]
+            let gate = combined.narrow(D::Minus1, 0, intermediate_size)?;
+            let up = combined.narrow(D::Minus1, intermediate_size, intermediate_size)?;
+            let gate = candle_nn::ops::silu(&gate)?;
+            Ok(self.down_proj.forward(&(gate * up)?)?)
+        } else {
+            // Fallback path
+            let gate = self.gate_proj.forward(x)?;
+            let gate = candle_nn::ops::silu(&gate)?;
+            let up = self.up_proj.forward(x)?;
+            Ok(self.down_proj.forward(&(gate * up)?)?)
+        }
     }
 }
 

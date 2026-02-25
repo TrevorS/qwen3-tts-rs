@@ -1441,6 +1441,17 @@ pub fn compute_dtype_for_device(device: &Device) -> DType {
     }
 }
 
+/// Return FP16 dtype for CUDA (can be faster than BF16 on some GPUs).
+pub fn compute_dtype_fp16(device: &Device) -> DType {
+    if device.is_cuda() {
+        DType::F16
+    } else if device.is_metal() {
+        DType::BF16
+    } else {
+        DType::F32
+    }
+}
+
 /// Force the GPU to complete all pending work before returning.
 ///
 /// On CUDA/Metal, GPU operations are asynchronous — `Instant::now()` would
@@ -1505,6 +1516,8 @@ pub struct StreamingSession<'a> {
     suppression_mask: generation::SuppressionMask,
     // Pre-allocated code predictor KV caches (reused + reset each frame)
     cp_kv_caches: Vec<AnyKVCache>,
+    // Sliding window for decoder (0 = full context)
+    decode_window_frames: usize,
 }
 
 impl<'a> StreamingSession<'a> {
@@ -1537,6 +1550,7 @@ impl<'a> StreamingSession<'a> {
             trailing_text_len,
             tts_pad_embed,
             options.chunk_frames,
+            options.decode_window_frames,
         )
     }
 
@@ -1573,6 +1587,7 @@ impl<'a> StreamingSession<'a> {
             trailing_text_len,
             tts_pad_embed,
             options.chunk_frames,
+            options.decode_window_frames,
         )
     }
 
@@ -1591,6 +1606,7 @@ impl<'a> StreamingSession<'a> {
         trailing_text_len: usize,
         tts_pad_embed: Tensor,
         chunk_frames: usize,
+        decode_window_frames: usize,
     ) -> Result<Self> {
         let (hidden, logits) = prefill_result;
         let prefill_len = hidden.dim(1)?;
@@ -1641,6 +1657,7 @@ impl<'a> StreamingSession<'a> {
             token_count: 1,
             suppression_mask,
             cp_kv_caches,
+            decode_window_frames,
         })
     }
 
@@ -1653,7 +1670,7 @@ impl<'a> StreamingSession<'a> {
             if !self.frame_buffer.is_empty() {
                 let codes = self.model.codes_to_tensor(&self.frame_buffer)?;
                 self.frame_buffer.clear();
-                let audio = self.model.decoder.decode(&codes)?;
+                let audio = self.decode_codes(&codes)?;
                 return Ok(Some(AudioBuffer::from_tensor(audio, 24000)?));
             }
             return Ok(None);
@@ -1678,12 +1695,15 @@ impl<'a> StreamingSession<'a> {
                 .talker
                 .get_codec_embedding_from_tensor(&token_tensor)?;
 
-            // Generate 15 acoustic codes (stays on GPU)
-            let acoustic_codes_tensor = self.model.code_predictor.generate_acoustic_codes(
-                &self.last_hidden,
-                &semantic_embed,
-                &mut self.cp_kv_caches,
-            )?;
+            // Generate 15 acoustic codes (stays on GPU) - use optimized method
+            let acoustic_codes_tensor = self
+                .model
+                .code_predictor
+                .generate_acoustic_codes_optimized(
+                    &self.last_hidden,
+                    &semantic_embed,
+                    &mut self.cp_kv_caches,
+                )?;
 
             // Build frame on GPU, then transfer for frame_buffer
             let semantic_t = Tensor::new(&[token_id], self.model.device())?;
@@ -1754,8 +1774,19 @@ impl<'a> StreamingSession<'a> {
 
         let codes = self.model.codes_to_tensor(&self.frame_buffer)?;
         self.frame_buffer.clear();
-        let audio = self.model.decoder.decode(&codes)?;
+        let audio = self.decode_codes(&codes)?;
         Ok(Some(AudioBuffer::from_tensor(audio, 24000)?))
+    }
+
+    /// Decode codec codes using sliding window if configured.
+    fn decode_codes(&self, codes: &Tensor) -> Result<Tensor> {
+        if self.decode_window_frames > 0 {
+            self.model
+                .decoder
+                .decode_with_window(codes, self.decode_window_frames)
+        } else {
+            self.model.decoder.decode(codes)
+        }
     }
 
     /// Returns the total number of frames generated so far.
@@ -1802,6 +1833,13 @@ pub struct SynthesisOptions {
     pub min_new_tokens: usize,
     /// Random seed for deterministic generation. `None` = non-deterministic.
     pub seed: Option<u64>,
+    /// Decoder sliding window size in frames (default: 0 = full context).
+    /// When > 0, decoder only sees the last N frames, reducing memory and
+    /// improving cache locality for long sequences. Python fork uses 80.
+    pub decode_window_frames: usize,
+    /// Emit audio every N frames during streaming (default: 4 = ~320ms).
+    /// Smaller values = lower latency but more chunks.
+    pub emit_every_frames: usize,
 }
 
 impl SynthesisOptions {
@@ -1831,6 +1869,8 @@ impl Default for SynthesisOptions {
             chunk_frames: 10, // ~800ms per chunk at 12.5 Hz
             min_new_tokens: 2,
             seed: None,
+            decode_window_frames: 0, // 0 = full context (backward compatible)
+            emit_every_frames: 4,    // ~320ms between chunks
         }
     }
 }
@@ -1963,6 +2003,7 @@ mod tests {
             chunk_frames: 5,
             min_new_tokens: 0,
             seed: Some(42),
+            ..Default::default()
         };
         assert_eq!(options.max_length, 512);
         assert!((options.temperature - 0.5).abs() < 1e-6);

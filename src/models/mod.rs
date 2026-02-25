@@ -17,7 +17,9 @@ pub mod speaker;
 pub mod talker;
 pub mod transformer;
 
-pub use code_predictor::{CodePredictor, CodePredictorConfig};
+pub use code_predictor::{
+    CodePredictor, CodePredictorConfig, CodePredictorProfile, CodePredictorTiming,
+};
 pub use config::{ModelType, ParsedModelConfig, Qwen3TTSConfig, SpeakerEncoderConfig};
 pub use kv_cache::{AnyKVCache, KVCache, PreAllocKVCache};
 pub use talker::{TalkerConfig, TalkerModel};

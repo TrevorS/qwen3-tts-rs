@@ -10,6 +10,10 @@
 //! # With JSON output:
 //! cargo run --release --features cli --bin e2e_bench -- \
 //!     --model-dir test_data --json-output results.json
+//!
+//! # Compare sliding window vs full context decoder:
+//! cargo run --release --features cli --bin e2e_bench -- \
+//!     --model-dir test_data --compare-decode-window 80
 //! ```
 
 use anyhow::Result;
@@ -57,6 +61,19 @@ struct Args {
     /// Only run these labels (comma-separated, e.g. "short,medium")
     #[arg(long, value_delimiter = ',')]
     labels: Vec<String>,
+
+    /// Decode window size for sliding window decoder (0 = full context)
+    #[arg(long, default_value_t = 0)]
+    decode_window: usize,
+
+    /// Compare sliding window vs full context: runs each benchmark twice
+    /// with the specified window size and reports the difference
+    #[arg(long)]
+    compare_decode_window: Option<usize>,
+
+    /// Profile code predictor to identify bottlenecks
+    #[arg(long)]
+    profile: bool,
 }
 
 // ── Result types ─────────────────────────────────────────────────────────
@@ -104,6 +121,8 @@ struct BenchmarkResult {
     peak_memory_mb: Option<f64>,
     /// Per-stage timing breakdown (averaged across iterations).
     stages: Option<StageBreakdown>,
+    /// Decode window size (0 = full context).
+    decode_window: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -204,9 +223,16 @@ struct SingleRunResult {
     timing: Option<SynthesisTiming>,
 }
 
-fn run_single(model: &Qwen3TTS, text: &str, seed: u64, streaming: bool) -> Result<SingleRunResult> {
+fn run_single(
+    model: &Qwen3TTS,
+    text: &str,
+    seed: u64,
+    streaming: bool,
+    decode_window: usize,
+) -> Result<SingleRunResult> {
     let options = SynthesisOptions {
         seed: Some(seed),
+        decode_window_frames: decode_window,
         ..Default::default()
     };
 
@@ -266,12 +292,13 @@ fn run_benchmark(
     label: &str,
     text: &str,
     args: &Args,
+    decode_window: usize,
 ) -> Result<BenchmarkResult> {
     let word_count = text.split_whitespace().count();
 
     // Warmup
     for _ in 0..args.warmup {
-        let _ = run_single(model, text, args.seed, args.streaming)?;
+        let _ = run_single(model, text, args.seed, args.streaming, decode_window)?;
     }
 
     // Timed runs
@@ -285,7 +312,7 @@ fn run_benchmark(
         // Sync device before each timed run to drain any stale GPU work
         qwen3_tts::sync_device(model.device())?;
 
-        let run = run_single(model, text, args.seed, args.streaming)?;
+        let run = run_single(model, text, args.seed, args.streaming, decode_window)?;
         wall_times.push(run.wall_ms);
         if let Some(t) = run.ttfa_ms {
             ttfa_times.push(t);
@@ -358,6 +385,7 @@ fn run_benchmark(
         frames_generated: last_frames,
         peak_memory_mb: peak_memory_mb(),
         stages: avg_stages,
+        decode_window,
     })
 }
 
@@ -466,6 +494,11 @@ fn main() -> Result<()> {
     if args.streaming {
         println!("Mode:   streaming (measuring TTFA)");
     }
+    if let Some(window) = args.compare_decode_window {
+        println!("Compare: decode_window=0 (full) vs decode_window={window} (sliding)");
+    } else if args.decode_window > 0 {
+        println!("Decode: sliding window ({} frames)", args.decode_window);
+    }
     println!();
 
     // Warn if CPU governor isn't set to performance (Linux only)
@@ -484,34 +517,118 @@ fn main() -> Result<()> {
         .into_iter()
         .filter(|(label, _)| args.labels.is_empty() || args.labels.iter().any(|l| l == label))
         .collect();
-    let mut results = Vec::with_capacity(corpus.len());
 
-    for (label, text) in &corpus {
-        print!("Benchmarking [{label}]...");
-        std::io::Write::flush(&mut std::io::stdout())?;
-        let result = run_benchmark(&model, label, text, &args)?;
-        println!(
-            " RTF={:.3} ({:.0}ms ±{:.0}, {:.2}s audio)",
-            result.rtf,
-            result.wall_clock_ms,
-            result.wall_clock_stddev_ms,
-            result.audio_duration_secs,
-        );
-        results.push(result);
+    // Comparison mode: run each benchmark with both full context and sliding window
+    if let Some(window_size) = args.compare_decode_window {
+        print_comparison_table(&model, &corpus, &args, window_size)?;
+    } else {
+        // Normal mode
+        let mut results = Vec::with_capacity(corpus.len());
+
+        for (label, text) in &corpus {
+            print!("Benchmarking [{label}]...");
+            std::io::Write::flush(&mut std::io::stdout())?;
+            let result = run_benchmark(&model, label, text, &args, args.decode_window)?;
+            println!(
+                " RTF={:.3} ({:.0}ms ±{:.0}, {:.2}s audio)",
+                result.rtf,
+                result.wall_clock_ms,
+                result.wall_clock_stddev_ms,
+                result.audio_duration_secs,
+            );
+            results.push(result);
+        }
+
+        print_table(&results);
+
+        if let Some(ref path) = args.json_output {
+            let report = BenchmarkReport {
+                device: device_info(model.device()),
+                model_dir: args.model_dir.clone(),
+                iterations: args.iterations,
+                results: results.clone(),
+            };
+            let json = serde_json::to_string_pretty(&report)?;
+            std::fs::write(path, &json)?;
+            println!("JSON results written to {path}");
+        }
     }
 
-    print_table(&results);
+    Ok(())
+}
 
-    if let Some(ref path) = args.json_output {
-        let report = BenchmarkReport {
-            device: device_info(model.device()),
-            model_dir: args.model_dir.clone(),
-            iterations: args.iterations,
-            results: results.clone(),
+// ── Comparison mode ───────────────────────────────────────────────────────
+
+fn print_comparison_table(
+    model: &Qwen3TTS,
+    corpus: &[(&str, &str)],
+    args: &Args,
+    window_size: usize,
+) -> Result<()> {
+    println!("=== Sliding Window Decoder Comparison ===");
+    println!("Comparing full context (window=0) vs sliding window (window={window_size})");
+    println!();
+    println!(
+        "{:<8} {:>8} {:>12} {:>12} {:>10} {:>10} {:>10}",
+        "Label", "Words", "Full (ms)", "Window (ms)", "Speedup", "Full RTF", "Win RTF"
+    );
+    println!("{}", "-".repeat(78));
+
+    let mut total_full_ms = 0.0f64;
+    let mut total_window_ms = 0.0f64;
+
+    for (label, text) in corpus {
+        print!("[{label}] full...");
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let full_result = run_benchmark(model, label, text, args, 0)?;
+        print!(" window...");
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let window_result = run_benchmark(model, label, text, args, window_size)?;
+
+        let speedup = if window_result.wall_clock_ms > 0.0 {
+            full_result.wall_clock_ms / window_result.wall_clock_ms
+        } else {
+            0.0
         };
-        let json = serde_json::to_string_pretty(&report)?;
-        std::fs::write(path, &json)?;
-        println!("JSON results written to {path}");
+
+        total_full_ms += full_result.wall_clock_ms;
+        total_window_ms += window_result.wall_clock_ms;
+
+        println!(
+            " {:>8.1} {:>12.1} {:>12.1} {:>9.2}x {:>10.3} {:>10.3}",
+            full_result.word_count,
+            full_result.wall_clock_ms,
+            window_result.wall_clock_ms,
+            speedup,
+            full_result.rtf,
+            window_result.rtf
+        );
+    }
+
+    println!("{}", "-".repeat(78));
+    let total_speedup = if total_window_ms > 0.0 {
+        total_full_ms / total_window_ms
+    } else {
+        0.0
+    };
+    println!(
+        "{:<8} {:>8} {:>12.1} {:>12.1} {:>9.2}x",
+        "TOTAL", "", total_full_ms, total_window_ms, total_speedup
+    );
+    println!();
+
+    if total_speedup > 1.0 {
+        println!(
+            "✓ Sliding window is {:.1}% faster",
+            (total_speedup - 1.0) * 100.0
+        );
+    } else if total_speedup < 1.0 {
+        println!(
+            "✗ Sliding window is {:.1}% slower",
+            (1.0 - total_speedup) * 100.0
+        );
+    } else {
+        println!("= No significant difference");
     }
 
     Ok(())
