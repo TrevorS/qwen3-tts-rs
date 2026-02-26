@@ -133,6 +133,15 @@ pub struct VoiceClonePrompt {
     pub ref_text_ids: Option<Vec<u32>>,
 }
 
+impl VoiceClonePrompt {
+    /// Get the speaker embedding as a flat vector of f32 values.
+    ///
+    /// Useful for saving/loading embeddings to disk.
+    pub fn get_embedding_vec(&self) -> Result<Vec<f32>> {
+        Ok(self.speaker_embedding.flatten_all()?.to_vec1()?)
+    }
+}
+
 /// Per-stage timing breakdown from a synthesis run.
 #[derive(Debug, Clone, Serialize)]
 pub struct SynthesisTiming {
@@ -1189,6 +1198,28 @@ impl Qwen3TTS {
             speaker_embedding,
             ref_codes,
             ref_text_ids,
+        })
+    }
+
+    /// Create a voice clone prompt from a pre-computed speaker embedding.
+    ///
+    /// This is useful for reusing saved embeddings without re-encoding reference audio.
+    /// The embedding should be a 1D tensor with shape `[enc_dim]` (typically 1024).
+    pub fn create_voice_clone_prompt_from_embedding(
+        &self,
+        speaker_embedding: Tensor,
+    ) -> Result<VoiceClonePrompt> {
+        if !self.supports_voice_cloning() {
+            anyhow::bail!(
+                "Voice cloning requires a Base model with a speaker encoder. \
+                 Current model does not support voice cloning."
+            );
+        }
+
+        Ok(VoiceClonePrompt {
+            speaker_embedding,
+            ref_codes: None,
+            ref_text_ids: None,
         })
     }
 
