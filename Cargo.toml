@@ -29,10 +29,10 @@ profiling = ["dep:tracing-chrome"]
 
 [dependencies]
 # Candle ML framework
-candle-core = "0.9"
-candle-nn = "0.9"
-candle-transformers = "0.9"
-candle-flash-attn = { version = "0.9", optional = true }
+candle-core = "0.11.1"
+candle-nn = "0.11.1"
+candle-transformers = "0.11.1"
+candle-flash-attn = { version = "0.11.1", optional = true }
 
 # Tokenization (HuggingFace tokenizers in Rust)
 tokenizers = "0.22"
